@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+dist-zip/
+py_modules/
+__pycache__/
+*.pyc
+preview/screenshots/
+preview/preview_bundle.js
+.DS_Store
+*.egg-info/
+.pytest_cache/

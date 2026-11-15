@@ -1,0 +1,18 @@
+{
+  "name": "SwitchDeck",
+  "author": "SwitchDeck Contributors",
+  "flags": [
+    "root"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "dock",
+      "display",
+      "controllers",
+      "utilities"
+    ],
+    "description": "Make Steam Deck docking seamless like Nintendo Switch: smart Player 1 controller handoff, universal game scaling, split audio/TDP/battery cap, Samsung Tizen & CEC TV control.",
+    "image": ""
+  }
+}

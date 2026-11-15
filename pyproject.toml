@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "switchdeck"
+version = "0.2.0"
+description = "Universal Switch-like docking daemon for Steam Deck & SteamOS (zero external dependencies)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+switchdeckd = "switchdeck.daemon:main"
+switchdeckctl = "switchdeck.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["switchdeck*"]

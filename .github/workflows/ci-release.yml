@@ -1,0 +1,53 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npm run typecheck
+
+      - name: Build Decky plugin ZIP
+        run: ./scripts/build_decky_zip.sh
+
+      - name: Run Python unit & integration tests
+        run: PYTHONPATH=src python3 -m unittest discover -s tests -v
+
+      - name: Check shell script syntax
+        run: bash -n scripts/*.sh preview/capture_screenshots.sh
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-zip/SwitchDeck.zip
+            dist-zip/SwitchDeck-v*.zip
+          generate_release_notes: true

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Minimal validated root sysfs helper for SwitchDeck.
+
+Permits ONLY two safe operations without running the full daemon as root:
+1. bind-neptune / unbind-neptune for verified Valve 28de:1205 usbhid interfaces.
+2. set-wakeup (enabled|disabled) on validated /sys/devices/.../power/wakeup nodes.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+IFACE_RE = re.compile(r"^[0-9]+-[0-9]+(?:\.[0-9]+)*:1\.[0-9]+\Z")
+USB_DEVICES_DIR = Path("/sys/bus/usb/devices")
+USB_HID_DIR = Path("/sys/bus/usb/drivers/usbhid")
+SYS_DEVICES_ROOT = "/sys/devices/"
+
+
+def validate_neptune_iface(iface: str, usb_devices_root: Path = USB_DEVICES_DIR) -> bool:
+    if not isinstance(iface, str) or not IFACE_RE.fullmatch(iface):
+        return False
+    bus_port = iface.split(":", 1)[0]
+    dev_dir = usb_devices_root / bus_port
+    try:
+        vid = (dev_dir / "idVendor").read_text(encoding="utf-8", errors="replace").strip().lower()
+        pid = (dev_dir / "idProduct").read_text(encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return False
+    return vid == "28de" and pid == "1205"
+
+
+def validate_wakeup_path(target: str, sys_devices_root: str = SYS_DEVICES_ROOT) -> Path | None:
+    if not target or "\x00" in target:
+        return None
+    try:
+        real = os.path.realpath(target)
+        root_real = os.path.realpath(sys_devices_root)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not root_real.endswith("/"):
+        root_real += "/"
+    if root_real == "/":
+        return None
+    if not real.startswith(root_real) or not real.endswith("/power/wakeup"):
+        return None
+    return Path(real)
+
+
+def safe_write_sysfs(path: Path, value: str) -> None:
+    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(os.fspath(path), flags)
+    try:
+        data = value.encode("utf-8")
+        view = memoryview(data)
+        written = 0
+        while written < len(data):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError("short write to sysfs node")
+            written += n
+    finally:
+        os.close(fd)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print("Usage: switchdeck-helper <bind-neptune|unbind-neptune|set-wakeup> <target> [value]", file=sys.stderr)
+        return 2
+
+    action, target = argv[1], argv[2]
+    if action in ("bind-neptune", "unbind-neptune"):
+        if len(argv) != 3:
+            print("Usage: switchdeck-helper <bind-neptune|unbind-neptune> <iface>", file=sys.stderr)
+            return 2
+        if not validate_neptune_iface(target):
+            print(f"Rejected non-Neptune interface: {target}", file=sys.stderr)
+            return 1
+        driver_node = USB_HID_DIR / ("bind" if action == "bind-neptune" else "unbind")
+        try:
+            safe_write_sysfs(driver_node, target)
+            return 0
+        except OSError as exc:
+            print(f"sysfs write failed: {exc}", file=sys.stderr)
+            return 1
+
+    if action == "set-wakeup":
+        if len(argv) != 4 or argv[3] not in ("enabled", "disabled"):
+            print("Usage: switchdeck-helper set-wakeup <sysfs-wakeup-path> <enabled|disabled>", file=sys.stderr)
+            return 2
+        wakeup_path = validate_wakeup_path(target)
+        if wakeup_path is None:
+            print(f"Rejected non-wakeup path: {target}", file=sys.stderr)
+            return 1
+        try:
+            safe_write_sysfs(wakeup_path, argv[3])
+            return 0
+        except OSError as exc:
+            print(f"wakeup write failed: {exc}", file=sys.stderr)
+            return 1
+
+    print(f"Unknown action: {action}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
