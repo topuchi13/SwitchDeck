@@ -202,14 +202,35 @@ class SwitchDeckDaemon:
             elif cmd == "get_profile":
                 async with self._reconcile_lock:
                     prof = await asyncio.to_thread(self.coordinator.get_active_profile)
-                    response = {"ok": True, "profile": prof.to_dict()}
+                    payload = await asyncio.to_thread(self.coordinator.get_profile_payload, prof)
+                    response = {"ok": True, "profile": payload}
             elif cmd == "update_profile":
                 patch = req.get("patch")
                 if not isinstance(patch, dict):
                     raise ValueError("Missing or non-dict 'patch' parameter")
                 async with self._reconcile_lock:
                     prof = await asyncio.to_thread(self.coordinator.update_active_profile, patch)
-                    response = {"ok": True, "profile": prof.to_dict()}
+                    payload = await asyncio.to_thread(self.coordinator.get_profile_payload, prof)
+                    response = {"ok": True, "profile": payload}
+            elif cmd == "pair_tv":
+                driver_name = str(req.get("driver") or "")
+                host = str(req.get("host") or "")
+                port = int(req.get("port") or 0)
+                mac = str(req.get("mac") or "")
+                hdmi_input = str(req.get("hdmi_input") or "")
+                psk = str(req.get("psk") or "")
+                trust_new_cert = bool(req.get("trust_new_cert"))
+                async with self._reconcile_lock:
+                    response = await asyncio.to_thread(
+                        self.coordinator.pair_tv,
+                        driver_name,
+                        host,
+                        port,
+                        mac,
+                        hdmi_input,
+                        psk,
+                        trust_new_cert,
+                    )
             elif cmd == "test_tv":
                 async with self._reconcile_lock:
                     woken = await asyncio.to_thread(self.coordinator.test_active_tv_wake)

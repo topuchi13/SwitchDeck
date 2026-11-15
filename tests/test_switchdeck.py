@@ -46,6 +46,7 @@ from switchdeck.domain import (
     GameWindowState,
     GamescopeFilter,
     GamescopeScaler,
+    TvDriverConfig,
     UnhandledDongleWarning,
 )
 from switchdeck.edid import make_synthetic_edid, parse_edid, select_best_output_mode
@@ -62,14 +63,24 @@ from switchdeck.security import (
     validate_game_pid,
     validate_hdmi_input,
     validate_host,
+    validate_mac_address,
     validate_neptune_iface,
     validate_overclock_args,
     validate_port,
+    validate_tv_secret,
     validate_wakeup_path,
     validate_webhook_url,
 )
 from switchdeck.session import resolve_user_session
-from switchdeck.tv import SamsungTizenDriver, WS_GUID, _WsPayloadTooLarge
+from switchdeck.tv import (
+    LgWebOsDriver,
+    RokuEcpDriver,
+    SamsungTizenDriver,
+    SonyBraviaDriver,
+    WS_GUID,
+    WakeOnLanTvDriver,
+    _WsPayloadTooLarge,
+)
 
 
 def _encode_unmasked_ws_frame(text: str) -> bytes:
@@ -1526,6 +1537,526 @@ class TestDockedOverclockAndGuardrails(unittest.TestCase):
             coord.close()
             self.assertFalse(backend.overclock_applied)
             self.assertTrue(backend.builtin_bound)
+
+
+def _recv_exact_test(sock: socket.socket, count: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_client_ws_json(sock: socket.socket) -> dict:
+    hdr = _recv_exact_test(sock, 2)
+    assert len(hdr) == 2
+    masked = bool(hdr[1] & 0x80)
+    length = hdr[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact_test(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact_test(sock, 8))[0]
+    mask = _recv_exact_test(sock, 4) if masked else b""
+    payload = _recv_exact_test(sock, length)
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return json.loads(payload.decode("utf-8"))
+
+
+def _encode_unmasked_ws_frame_any(obj: dict) -> bytes:
+    data = json.dumps(obj).encode("utf-8")
+    if len(data) < 126:
+        return bytes([0x81, len(data)]) + data
+    if len(data) < 65536:
+        return bytes([0x81, 126]) + struct.pack("!H", len(data)) + data
+    return bytes([0x81, 127]) + struct.pack("!Q", len(data)) + data
+
+
+class TestMultiBrandSmartTvDrivers(unittest.IsolatedAsyncioTestCase):
+    def test_lg_webos_tls_pair_switch_input_fallback_and_token_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cert1, key1, fp1 = TestSamsungTlsTofuAndWsHardening._generate_self_signed_cert(tmp_path, "lg1")
+            cert2, key2, fp2 = TestSamsungTlsTofuAndWsHardening._generate_self_signed_cert(tmp_path, "lg2")
+            self.assertNotEqual(fp1, fp2)
+
+            active_cert: list[tuple[Path, Path]] = [(cert1, key1)]
+            seen_registers: list[dict] = []
+            seen_requests: list[tuple[str, dict]] = []
+            stop_srv = threading.Event()
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(8)
+            srv.settimeout(0.2)
+            port = srv.getsockname()[1]
+
+            def ssap_tls_server() -> None:
+                while not stop_srv.is_set():
+                    try:
+                        conn, _ = srv.accept()
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        c_path, k_path = active_cert[0]
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                        ctx.load_cert_chain(certfile=str(c_path), keyfile=str(k_path))
+                        with ctx.wrap_socket(conn, server_side=True) as tls_conn:
+                            req = tls_conn.recv(4096).decode("ascii", errors="ignore")
+                            if "sec-websocket-key:" not in req.lower():
+                                continue
+                            key_line = [
+                                ln for ln in req.splitlines() if ln.lower().startswith("sec-websocket-key:")
+                            ][0]
+                            ws_key = key_line.split(":", 1)[1].strip()
+                            accept = base64.b64encode(
+                                hashlib.sha1((ws_key + WS_GUID).encode("ascii")).digest()
+                            ).decode("ascii")
+                            tls_conn.sendall(
+                                f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                                f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode("ascii")
+                            )
+                            reg = _read_client_ws_json(tls_conn)
+                            seen_registers.append(reg)
+                            has_key = reg.get("payload", {}).get("client-key") == "lg_key_abc"
+                            if not has_key:
+                                tls_conn.sendall(
+                                    _encode_unmasked_ws_frame_any(
+                                        {
+                                            "type": "response",
+                                            "id": reg.get("id"),
+                                            "payload": {"pairingType": "PROMPT", "returnValue": True},
+                                        }
+                                    )
+                                )
+                            tls_conn.sendall(
+                                _encode_unmasked_ws_frame_any(
+                                    {
+                                        "type": "registered",
+                                        "id": reg.get("id"),
+                                        "payload": {"client-key": "lg_key_abc"},
+                                    }
+                                )
+                            )
+                            if not has_key:
+                                continue
+                            # Handle turnOnScreen -> switchInput (returnValue False) -> launcher fallback
+                            while True:
+                                try:
+                                    cmd = _read_client_ws_json(tls_conn)
+                                except (AssertionError, OSError):
+                                    break
+                                uri = cmd.get("uri", "")
+                                payload = cmd.get("payload", {})
+                                seen_requests.append((uri, payload))
+                                if uri == "ssap://tv/switchInput":
+                                    tls_conn.sendall(
+                                        _encode_unmasked_ws_frame_any(
+                                            {"type": "response", "id": cmd.get("id"), "payload": {"returnValue": False}}
+                                        )
+                                    )
+                                else:
+                                    tls_conn.sendall(
+                                        _encode_unmasked_ws_frame_any(
+                                            {"type": "response", "id": cmd.get("id"), "payload": {"returnValue": True}}
+                                        )
+                                    )
+                    except (OSError, ssl.SSLError, AssertionError):
+                        pass
+                    finally:
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
+
+            t = threading.Thread(target=ssap_tls_server, daemon=True)
+            t.start()
+            try:
+                store = ProfileStore(tmp_path / "cfg")
+                # Seed an existing Samsung token for same host to prove isolation
+                store.set_driver_token("samsung_tizen", "127.0.0.1", "samsung_tok_keep")
+
+                client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                client_ctx.check_hostname = False
+                client_ctx.verify_mode = ssl.CERT_NONE
+                driver = LgWebOsDriver(
+                    get_token=lambda h: store.get_driver_token("lg_webos", h),
+                    set_token=lambda h, tok: store.set_driver_token("lg_webos", h, tok),
+                    ssl_context=client_ctx,
+                    get_cert_fingerprint=store.get_cert_fingerprint,
+                    set_cert_fingerprint=store.set_cert_fingerprint,
+                )
+
+                key, actual_port = driver.pair_with_port("127.0.0.1", port=port)
+                self.assertEqual(key, "lg_key_abc")
+                self.assertEqual(actual_port, port)
+                self.assertEqual(store.get_driver_token("lg_webos", "127.0.0.1"), "lg_key_abc")
+                self.assertEqual(store.get_token("127.0.0.1"), "samsung_tok_keep")
+                self.assertEqual(store.get_cert_fingerprint("127.0.0.1"), fp1)
+
+                manifest = seen_registers[0]["payload"]["manifest"]
+                self.assertNotIn("signatures", manifest)
+                self.assertNotIn("signed", manifest)
+
+                ok = driver.wake_and_switch(
+                    TvDriverConfig(driver="lg_webos", host="127.0.0.1", port=port, hdmi_input="HDMI2")
+                )
+                self.assertTrue(ok)
+                self.assertEqual(seen_registers[1]["payload"]["client-key"], "lg_key_abc")
+                self.assertEqual(
+                    seen_requests,
+                    [
+                        ("ssap://system/turnOnScreen", {}),
+                        ("ssap://tv/switchInput", {"inputId": "HDMI_2"}),
+                        ("ssap://system.launcher/launch", {"id": "com.webos.app.hdmi2"}),
+                    ],
+                )
+
+                # Certificate swap triggers TOFU failure on pair and False on wake_and_switch
+                active_cert[0] = (cert2, key2)
+                with self.assertRaises(ssl.SSLCertVerificationError):
+                    driver.pair("127.0.0.1", port=port)
+                self.assertFalse(
+                    driver.wake_and_switch(
+                        TvDriverConfig(driver="lg_webos", host="127.0.0.1", port=port, hdmi_input="HDMI2")
+                    )
+                )
+            finally:
+                stop_srv.set()
+                srv.close()
+                t.join(timeout=2.0)
+
+    def test_lg_webos_legacy_3000_fallback_vs_tls_anti_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            stop_srv = threading.Event()
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            srv.settimeout(0.2)
+            ws_port = srv.getsockname()[1]
+
+            def plain_ws_3000() -> None:
+                while not stop_srv.is_set():
+                    try:
+                        conn, _ = srv.accept()
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    with conn:
+                        req = conn.recv(4096).decode("ascii", errors="ignore")
+                        ws_key = [
+                            ln for ln in req.splitlines() if ln.lower().startswith("sec-websocket-key:")
+                        ][0].split(":", 1)[1].strip()
+                        accept = base64.b64encode(
+                            hashlib.sha1((ws_key + WS_GUID).encode("ascii")).digest()
+                        ).decode("ascii")
+                        conn.sendall(
+                            f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode("ascii")
+                        )
+                        reg = _read_client_ws_json(conn)
+                        conn.sendall(
+                            _encode_unmasked_ws_frame_any(
+                                {"type": "registered", "id": reg.get("id"), "payload": {"client-key": "lg_ws_3000"}}
+                            )
+                        )
+
+            t = threading.Thread(target=plain_ws_3000, daemon=True)
+            t.start()
+            orig_create = socket.create_connection
+            connect_ports: list[int] = []
+
+            def routed_create_connection(address, timeout=None):
+                host, p = address
+                connect_ports.append(p)
+                if p == 3001:
+                    raise ConnectionRefusedError("No TLS listener on 3001")
+                if p == 3000:
+                    return orig_create((host, ws_port), timeout=timeout)
+                return orig_create(address, timeout=timeout)
+
+            try:
+                store = ProfileStore(tmp_path / "cfg")
+                driver = LgWebOsDriver(
+                    get_token=lambda h: store.get_driver_token("lg_webos", h),
+                    set_token=lambda h, tok: store.set_driver_token("lg_webos", h, tok),
+                    get_cert_fingerprint=store.get_cert_fingerprint,
+                    set_cert_fingerprint=store.set_cert_fingerprint,
+                )
+
+                with mock.patch("switchdeck.tv.socket.create_connection", side_effect=routed_create_connection):
+                    key, actual_port = driver.pair_with_port("127.0.0.1", port=3001)
+                self.assertEqual(key, "lg_ws_3000")
+                self.assertEqual(actual_port, 3000)
+                self.assertEqual(connect_ports, [3001, 3000])
+
+                # Once a TLS cert fingerprint is pinned, :3001 ConnectionRefusedError MUST NOT downgrade to :3000
+                connect_ports.clear()
+                store.set_cert_fingerprint("127.0.0.1", "ab" * 32)
+                with mock.patch("switchdeck.tv.socket.create_connection", side_effect=routed_create_connection):
+                    with self.assertRaises(ConnectionRefusedError):
+                        driver.pair_with_port("127.0.0.1", port=3001)
+                self.assertEqual(connect_ports, [3001])
+            finally:
+                stop_srv.set()
+                srv.close()
+                t.join(timeout=2.0)
+
+    def test_sony_bravia_psk_wake_hdmi_and_secret_isolation(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.assertEqual(validate_mac_address("aa-bb-cc-dd-ee-ff"), "AA:BB:CC:DD:EE:FF")
+        with self.assertRaises(ValueError):
+            validate_mac_address("not-a-mac")
+        with self.assertRaises(ValueError):
+            validate_tv_secret("bad\r\nX-Inject: 1")
+
+        seen_calls: list[tuple[str, str, list]] = []
+
+        class _BraviaHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                if self.headers.get("X-Auth-PSK") != "bravia-4242":
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.loads(raw.decode("utf-8"))
+                seen_calls.append((self.path, body.get("method"), body.get("params")))
+                payload = json.dumps({"id": 1, "result": []}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        srv = HTTPServer(("127.0.0.1", 0), _BraviaHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = ProfileStore(Path(tmp))
+                coord = SwitchDeckCoordinator(MockHardwareBackend(), store=store)
+                sony = SonyBraviaDriver(
+                    get_psk=lambda h: store.get_driver_token("sony_bravia", h),
+                    set_psk=lambda h, s: store.set_driver_token("sony_bravia", h, s),
+                )
+                with self.assertRaises(PermissionError):
+                    sony.pair("127.0.0.1", port=srv.server_port, psk="wrong")
+
+                res = coord.pair_tv(
+                    "sony_bravia",
+                    "127.0.0.1",
+                    port=srv.server_port,
+                    hdmi_input="HDMI3",
+                    psk="bravia-4242",
+                )
+                self.assertTrue(res["ok"])
+                self.assertTrue(res["profile"]["tv_paired"])
+                self.assertNotIn("psk", res["profile"]["tv"])
+                self.assertNotIn("bravia-4242", store.profiles_path.read_text(encoding="utf-8"))
+                self.assertNotIn("bravia-4242", json.dumps(coord.get_profile_payload()))
+                self.assertEqual(store.tokens_path.stat().st_mode & 0o777, 0o600)
+
+                seen_calls.clear()
+                self.assertTrue(coord.test_active_tv_wake())
+                self.assertEqual(
+                    seen_calls,
+                    [
+                        ("/sony/system", "setPowerStatus", [{"status": True}]),
+                        ("/sony/avContent", "setPlayContent", [{"uri": "extInput:hdmi?port=3"}]),
+                    ],
+                )
+                coord.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=2.0)
+
+    def test_roku_ecp_and_wake_on_lan_driver(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        roku_paths: list[str] = []
+
+        class _RokuHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    self.rfile.read(length)
+                roku_paths.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = HTTPServer(("127.0.0.1", 0), _RokuHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        udp.settimeout(2.0)
+        try:
+            roku = RokuEcpDriver()
+            ok = roku.wake_and_switch(
+                TvDriverConfig(driver="roku_ecp", host="127.0.0.1", port=srv.server_port, hdmi_input="HDMI4")
+            )
+            self.assertTrue(ok)
+            self.assertEqual(roku_paths, ["/keypress/PowerOn", "/keypress/InputHDMI4"])
+
+            wol = WakeOnLanTvDriver()
+            ok_wol = wol.wake_and_switch(
+                TvDriverConfig(
+                    driver="wol",
+                    host="127.0.0.1",
+                    port=udp.getsockname()[1],
+                    mac_address="aa:bb:cc:dd:ee:ff",
+                )
+            )
+            self.assertTrue(ok_wol)
+            pkt, _ = udp.recvfrom(256)
+            self.assertEqual(pkt, b"\xff" * 6 + bytes.fromhex("AABBCCDDEEFF") * 16)
+        finally:
+            udp.close()
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=2.0)
+
+    async def test_coordinator_default_ports_plugin_pair_tv_and_cli_pair_tv(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _OkBravia(BaseHTTPRequestHandler):
+            def log_message(self, format, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    self.rfile.read(length)
+                if self.headers.get("X-Auth-PSK") != "sony-9999":
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = json.dumps({"id": 1, "result": []}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        srv = HTTPServer(("127.0.0.1", 0), _OkBravia)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = ProfileStore(Path(tmp) / "cfg")
+                coord = SwitchDeckCoordinator(MockHardwareBackend(), store=store)
+                self.assertEqual(coord.update_active_profile({"tv": {"driver": "lg_webos"}}).tv.port, 3001)
+                self.assertEqual(coord.update_active_profile({"tv": {"driver": "sony_bravia"}}).tv.port, 80)
+                self.assertEqual(coord.update_active_profile({"tv": {"driver": "roku_ecp"}}).tv.port, 8060)
+                self.assertEqual(coord.update_active_profile({"tv": {"driver": "wol"}}).tv.port, 9)
+                self.assertEqual(coord.update_active_profile({"tv": {"driver": "samsung_tizen"}}).tv.port, 8002)
+                self.assertEqual(
+                    coord.update_active_profile({"tv": {"driver": "lg_webos", "port": 31337}}).tv.port,
+                    31337,
+                )
+                coord.close()
+
+                # Test switchdeckctl pair-tv
+                with mock.patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": str(Path(tmp) / "cli_cfg")}):
+                    rc = cli_main(
+                        [
+                            "pair-tv",
+                            "--driver",
+                            "sony_bravia",
+                            "127.0.0.1",
+                            "--port",
+                            str(srv.server_port),
+                            "--hdmi",
+                            "HDMI2",
+                            "--psk",
+                            "sony-9999",
+                            "--mac",
+                            "aa:bb:cc:dd:ee:ff",
+                        ]
+                    )
+                    self.assertEqual(rc, 0)
+                    cli_store = ProfileStore(Path(tmp) / "cli_cfg")
+                    cli_prof = cli_store.get_profile("default")
+                    self.assertEqual(cli_prof.tv.driver, "sony_bravia")
+                    self.assertEqual(cli_prof.tv.port, srv.server_port)
+                    self.assertEqual(cli_prof.tv.mac_address, "AA:BB:CC:DD:EE:FF")
+                    self.assertEqual(cli_prof.tv.hdmi_input, "HDMI2")
+                    self.assertEqual(cli_store.get_driver_token("sony_bravia", "127.0.0.1"), "sony-9999")
+
+                # Test Decky Plugin.pair_tv RPC
+                repo_root = Path(__file__).resolve().parents[1]
+                repo_root_str = str(repo_root)
+                added = False
+                if repo_root_str not in sys.path:
+                    sys.path.insert(0, repo_root_str)
+                    added = True
+                fake_decky = types.ModuleType("decky")
+                fake_decky.logger = logging.getLogger("switchdeck.test_pair_tv")  # type: ignore[attr-defined]
+                fake_decky.DECKY_PLUGIN_SETTINGS_DIR = str(Path(tmp) / "decky_pair")  # type: ignore[attr-defined]
+                fake_decky.DECKY_USER = ""  # type: ignore[attr-defined]
+                fake_decky.DECKY_USER_HOME = ""  # type: ignore[attr-defined]
+
+                async def _noop_emit(_ev: str, _pl: dict) -> None:
+                    return
+
+                fake_decky.emit = _noop_emit  # type: ignore[attr-defined]
+                orig_decky = sys.modules.get("decky")
+                orig_main = sys.modules.get("main")
+                mock_hw = MockHardwareBackend(deck_model=DeckModel.GALILEO_OLED)
+                try:
+                    sys.modules["decky"] = fake_decky
+                    with mock.patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": str(Path(tmp) / "decky_pair")}):
+                        main_mod = importlib.reload(importlib.import_module("main"))
+                        plugin = main_mod.Plugin()
+                        with mock.patch.object(main_mod, "LinuxHardwareBackend", return_value=mock_hw):
+                            await plugin._main()
+                            rpc_res = await plugin.pair_tv(
+                                "sony_bravia",
+                                "127.0.0.1",
+                                srv.server_port,
+                                "11-22-33-44-55-66",
+                                "HDMI4",
+                                "sony-9999",
+                                False,
+                            )
+                            self.assertTrue(rpc_res["ok"])
+                            self.assertEqual(rpc_res["driver"], "sony_bravia")
+                            self.assertEqual(rpc_res["profile"]["tv"]["hdmi_input"], "HDMI4")
+                            self.assertEqual(rpc_res["profile"]["tv"]["mac_address"], "11:22:33:44:55:66")
+                            self.assertTrue(rpc_res["profile"]["tv_paired"])
+                            await plugin._shutdown()
+                finally:
+                    if orig_decky is None:
+                        sys.modules.pop("decky", None)
+                    else:
+                        sys.modules["decky"] = orig_decky
+                    if orig_main is None:
+                        sys.modules.pop("main", None)
+                    else:
+                        sys.modules["main"] = orig_main
+                    if added:
+                        sys.path.remove(repo_root_str)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=2.0)
 
 
 if __name__ == "__main__":

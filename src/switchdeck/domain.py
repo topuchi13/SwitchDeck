@@ -231,11 +231,53 @@ def _clamp_gpu_max_mhz(value: Any, default: int = 0) -> int:
     return max(MIN_OVERCLOCK_GPU_MHZ, min(MAX_OVERCLOCK_GPU_MHZ, parsed))
 
 
+VALID_TV_DRIVERS: frozenset[str] = frozenset(
+    {
+        "cec",
+        "samsung_tizen",
+        "lg_webos",
+        "sony_bravia",
+        "roku_ecp",
+        "wol",
+        "webhook",
+        "none",
+    }
+)
+
+DEFAULT_TV_PORTS: dict[str, int] = {
+    "cec": 8002,
+    "samsung_tizen": 8002,
+    "lg_webos": 3001,
+    "sony_bravia": 80,
+    "roku_ecp": 8060,
+    "wol": 9,
+    "webhook": 443,
+    "none": 8002,
+}
+
+_TV_HDMI_INPUT_MAP: dict[str, str] = {
+    "HDMI1": "HDMI1",
+    "HDMI2": "HDMI2",
+    "HDMI3": "HDMI3",
+    "HDMI4": "HDMI4",
+    "AV1": "AV1",
+    "TUNER": "Tuner",
+}
+
+
+def _clean_tv_str(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return ""
+    return value.strip()
+
+
 @dataclass
 class TvDriverConfig:
     """Per-dock TV control settings (supports CEC + LAN Smart TVs)."""
 
-    driver: str = "cec"  # "cec", "samsung_tizen", "roku_ecp", "webhook", "none"
+    driver: str = "cec"
     host: str = ""
     port: int = 8002
     mac_address: str = ""
@@ -243,6 +285,42 @@ class TvDriverConfig:
     webhook_url: str = ""
     auto_power_on: bool = True
     auto_switch_input: bool = True
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> TvDriverConfig:
+        if not isinstance(raw, dict):
+            return cls()
+        raw_driver = raw.get("driver", cls.driver)
+        driver = str(raw_driver if raw_driver is not None else cls.driver).strip().lower()
+        if driver not in VALID_TV_DRIVERS:
+            driver = cls.driver
+        default_port = DEFAULT_TV_PORTS.get(driver, 8002)
+        if "port" in raw and raw["port"] is not None:
+            port = _clamp_int(raw["port"], 1, 65535, default_port)
+        else:
+            port = default_port
+
+        raw_hdmi = raw.get("hdmi_input")
+        hdmi_key = raw_hdmi.strip().upper() if isinstance(raw_hdmi, str) else ""
+        hdmi_input = _TV_HDMI_INPUT_MAP.get(hdmi_key, cls.hdmi_input)
+
+        auto_power_raw = raw.get("auto_power_on")
+        auto_power_on = auto_power_raw if isinstance(auto_power_raw, bool) else cls.auto_power_on
+        auto_switch_raw = raw.get("auto_switch_input")
+        auto_switch_input = (
+            auto_switch_raw if isinstance(auto_switch_raw, bool) else cls.auto_switch_input
+        )
+
+        return cls(
+            driver=driver,
+            host=_clean_tv_str(raw.get("host")),
+            port=port,
+            mac_address=_clean_tv_str(raw.get("mac_address")),
+            hdmi_input=hdmi_input,
+            webhook_url=_clean_tv_str(raw.get("webhook_url")),
+            auto_power_on=auto_power_on,
+            auto_switch_input=auto_switch_input,
+        )
 
 
 @dataclass
@@ -317,12 +395,7 @@ class DockProfile:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DockProfile:
-        tv_raw = data.get("tv")
-        if not isinstance(tv_raw, dict):
-            tv_raw = {}
-        tv = TvDriverConfig(
-            **{k: v for k, v in tv_raw.items() if k in TvDriverConfig.__dataclass_fields__}
-        )
+        tv = TvDriverConfig.from_dict(data.get("tv"))
         overclock = DockedOverclockConfig.from_dict(data.get("overclock"))
         kwargs: dict[str, Any] = {
             k: v

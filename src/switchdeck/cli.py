@@ -13,10 +13,10 @@ from typing import Any
 from .backends import LinuxHardwareBackend, MockHardwareBackend
 from .coordinator import SwitchDeckCoordinator
 from .daemon import default_socket_path
-from .domain import DeckModel, GameWindowState
+from .domain import DEFAULT_TV_PORTS, DeckModel, GameWindowState
 from .profiles import ProfileStore
-from .security import validate_host, validate_port
-from .tv import SamsungTizenDriver
+from .security import validate_hdmi_input, validate_host, validate_mac_address, validate_port
+from .tv import LgWebOsDriver, SamsungTizenDriver, SonyBraviaDriver
 
 
 def _send_ipc(cmd: str, socket_path: Path) -> dict[str, Any] | None:
@@ -136,6 +136,37 @@ def main(argv: list[str] | None = None) -> int:
         help="Accept and re-pin a changed Samsung TV TLS certificate fingerprint",
     )
 
+    pair_tv_p = sub.add_parser(
+        "pair-tv",
+        help="Pair & configure a Samsung Tizen, LG webOS, or Sony Bravia Smart TV",
+    )
+    pair_tv_p.add_argument(
+        "--driver",
+        required=True,
+        choices=["samsung_tizen", "lg_webos", "sony_bravia"],
+        help="Smart TV protocol driver",
+    )
+    pair_tv_p.add_argument("host", help="Smart TV LAN IP address or hostname")
+    pair_tv_p.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Override driver default port (8002 Samsung, 3001 LG webOS, 80 Sony Bravia)",
+    )
+    pair_tv_p.add_argument("--mac", default="", help="Optional TV MAC address for Wake-on-LAN")
+    pair_tv_p.add_argument(
+        "--hdmi",
+        default="",
+        help="Target HDMI input to switch to on dock (e.g. HDMI1..HDMI4)",
+    )
+    pair_tv_p.add_argument("--psk", default="", help="Sony Bravia Pre-Shared Key (X-Auth-PSK)")
+    pair_tv_p.add_argument("--profile", default="default", help="EDID profile ID (or 'default')")
+    pair_tv_p.add_argument(
+        "--trust-new-cert",
+        action="store_true",
+        help="Accept and re-pin a changed TV TLS certificate fingerprint",
+    )
+
     args = parser.parse_args(argv)
     sock_path = default_socket_path()
 
@@ -168,6 +199,61 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (ValueError, OSError) as exc:
             print(f"Failed to pair Samsung TV: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "pair-tv":
+        try:
+            drv = args.driver
+            host = validate_host(args.host)
+            default_port = DEFAULT_TV_PORTS.get(drv, 8002)
+            port = validate_port(args.port or default_port)
+            clean_mac = validate_mac_address(args.mac) if args.mac else ""
+            clean_hdmi = validate_hdmi_input(args.hdmi) if args.hdmi else ""
+            store = ProfileStore()
+            if args.trust_new_cert and drv in ("samsung_tizen", "lg_webos"):
+                store.clear_cert_fingerprint(host)
+
+            actual_port = port
+            if drv == "samsung_tizen":
+                tv_driver = SamsungTizenDriver(
+                    get_token=lambda h: store.get_driver_token(drv, h),
+                    set_token=lambda h, t: store.set_driver_token(drv, h, t),
+                    get_cert_fingerprint=store.get_cert_fingerprint,
+                    set_cert_fingerprint=store.set_cert_fingerprint,
+                )
+                token = tv_driver.pair(host, port=port, trust_new_cert=args.trust_new_cert)
+            elif drv == "lg_webos":
+                lg_driver = LgWebOsDriver(
+                    get_token=lambda h: store.get_driver_token(drv, h),
+                    set_token=lambda h, t: store.set_driver_token(drv, h, t),
+                    get_cert_fingerprint=store.get_cert_fingerprint,
+                    set_cert_fingerprint=store.set_cert_fingerprint,
+                )
+                token, actual_port = lg_driver.pair_with_port(
+                    host, port=port, trust_new_cert=args.trust_new_cert
+                )
+            else:
+                sony_driver = SonyBraviaDriver(
+                    get_psk=lambda h: store.get_driver_token(drv, h),
+                    set_psk=lambda h, t: store.set_driver_token(drv, h, t),
+                )
+                token = sony_driver.pair(host, port=port, psk=args.psk)
+
+            prof = store.get_profile(args.profile)
+            prof.tv.driver = drv
+            prof.tv.host = host
+            prof.tv.port = actual_port
+            if clean_mac:
+                prof.tv.mac_address = clean_mac
+            if clean_hdmi:
+                prof.tv.hdmi_input = clean_hdmi
+            store.put_profile(prof)
+            print(
+                f"Paired {drv} TV {host}:{actual_port} "
+                f"(credential saved={'yes' if token else 'pending'})."
+            )
+            return 0
+        except (ValueError, OSError) as exc:
+            print(f"Failed to pair {args.driver} TV: {exc}", file=sys.stderr)
             return 1
 
     ipc_map = {

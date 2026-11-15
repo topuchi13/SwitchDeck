@@ -12,6 +12,8 @@ import type {
   DaemonStatus,
   DockProfile,
   PairSamsungResult,
+  PairTvParams,
+  PairTvResult,
   SwitchDeckTransport,
   TransitionPayload,
 } from "./ui/types";
@@ -35,6 +37,9 @@ const setChargeOverrideRpc = callable<[boolean], DaemonStatus>("set_charge_overr
 const nudgeDisplayRpc = callable<[], { ok: boolean }>("nudge_display");
 const pairSamsungTvRpc = callable<[string, number, string, boolean], PairSamsungResult>(
   "pair_samsung_tv",
+);
+const pairTvRpc = callable<[string, string, number, string, string, string, boolean], PairTvResult>(
+  "pair_tv",
 );
 const testTvWakeRpc = callable<[], { ok: boolean }>("test_tv_wake");
 
@@ -77,6 +82,15 @@ const transport: SwitchDeckTransport = {
   nudgeDisplay: () => nudgeDisplayRpc(),
   pairSamsungTv: (host, port = 8002, mac = "", trustNewCert = false) =>
     pairSamsungTvRpc(host, port, mac, trustNewCert),
+  pairTv: ({
+    driver,
+    host,
+    port = 0,
+    mac = "",
+    hdmiInput = "",
+    psk = "",
+    trustNewCert = false,
+  }: PairTvParams) => pairTvRpc(driver, host, port, mac, hdmiInput, psk, trustNewCert),
   testTvWake: () => testTvWakeRpc(),
   applyNativeAppResolution,
 };

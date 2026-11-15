@@ -178,6 +178,35 @@ def validate_webhook_url(url: str) -> str:
     return cleaned
 
 
+def validate_mac_address(mac: str) -> str:
+    """Validate and canonicalize an optional Ethernet/Wi-Fi MAC address (AA:BB:CC:DD:EE:FF)."""
+    if not isinstance(mac, str):
+        raise ValueError("MAC address must be a string")
+    if "\r" in mac or "\n" in mac or any(ord(ch) < 32 or ord(ch) == 127 for ch in mac):
+        raise ValueError(f"Invalid control/newline character in MAC address: {mac!r}")
+    cleaned = mac.strip()
+    if not cleaned:
+        return ""
+    if any(ch not in "0123456789abcdefABCDEF:-." for ch in cleaned):
+        raise ValueError(f"Invalid MAC address format: {mac!r}")
+    hex_digits = "".join(ch for ch in cleaned if ch not in ":-.")
+    if len(hex_digits) != 12:
+        raise ValueError(f"MAC address must contain 12 hex digits: {mac!r}")
+    return ":".join(hex_digits[i : i + 2].upper() for i in range(0, 12, 2))
+
+
+def validate_tv_secret(secret: str) -> str:
+    """Validate a TV auth token/PSK without CR/LF/NUL/control characters."""
+    if not isinstance(secret, str):
+        raise ValueError("TV secret/PSK must be a string")
+    if "\r" in secret or "\n" in secret or any(ord(ch) < 32 or ord(ch) == 127 for ch in secret):
+        raise ValueError("TV secret/PSK must not contain CR/LF or control characters")
+    cleaned = secret.strip()
+    if not cleaned or len(cleaned) > 256:
+        raise ValueError("TV secret/PSK must be 1..256 non-whitespace characters")
+    return cleaned
+
+
 def capture_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> str | None:
     """Read field 22 (starttime) from /proc/<pid>/stat, or 'nonproc' when /proc is absent."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:

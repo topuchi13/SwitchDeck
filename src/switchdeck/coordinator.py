@@ -10,6 +10,7 @@ from typing import Any
 
 from .backends.protocol import HardwareBackend
 from .domain import (
+    DEFAULT_TV_PORTS,
     DaemonStatus,
     DeckModel,
     DisplayConnector,
@@ -24,7 +25,19 @@ from .domain import (
 from .edid import select_best_output_mode
 from .profiles import ProfileStore
 from .scaling import compute_universal_scaling
-from .tv import create_tv_driver
+from .security import (
+    validate_hdmi_input,
+    validate_host,
+    validate_mac_address,
+    validate_port,
+    validate_tv_secret,
+)
+from .tv import (
+    LgWebOsDriver,
+    SamsungTizenDriver,
+    SonyBraviaDriver,
+    create_tv_driver,
+)
 
 LOG = logging.getLogger("switchdeck.coordinator")
 MAX_HOLD_PAUSE_SEC = 15.0
@@ -121,8 +134,10 @@ class SwitchDeckCoordinator:
             cec_trigger=self.backend.trigger_hdmi_cec_wake,
             get_token=self.store.get_token,
             set_token=self.store.set_token,
-            get_cert_fingerprint=self.store.get_cert_fingerprint,
-            set_cert_fingerprint=self.store.set_cert_fingerprint,
+            get_cert_fingerprint=getattr(self.store, "get_cert_fingerprint", None),
+            set_cert_fingerprint=getattr(self.store, "set_cert_fingerprint", None),
+            get_driver_token=getattr(self.store, "get_driver_token", None),
+            set_driver_token=getattr(self.store, "set_driver_token", None),
         )
         if driver is None:
             return
@@ -595,12 +610,27 @@ class SwitchDeckCoordinator:
         with self._lock:
             current = self.get_active_profile()
             merged = current.to_dict()
+            pending_psk: tuple[str, str] | None = None
             if isinstance(patch, dict):
                 tv_patch = patch.get("tv")
                 if isinstance(tv_patch, dict):
+                    tv_patch_clean = dict(tv_patch)
+                    psk_raw = tv_patch_clean.pop("psk", None)
                     merged_tv = dict(merged.get("tv") or {})
-                    merged_tv.update(tv_patch)
+                    if "driver" in tv_patch_clean and "port" not in tv_patch_clean:
+                        next_drv = str(tv_patch_clean.get("driver") or "cec").strip().lower()
+                        if next_drv != current.tv.driver:
+                            merged_tv["port"] = DEFAULT_TV_PORTS.get(next_drv, 8002)
+                    if "mac_address" in tv_patch_clean and tv_patch_clean["mac_address"] is not None:
+                        tv_patch_clean["mac_address"] = validate_mac_address(
+                            str(tv_patch_clean["mac_address"])
+                        )
+                    merged_tv.update(tv_patch_clean)
                     merged["tv"] = merged_tv
+                    if isinstance(psk_raw, str) and psk_raw.strip():
+                        clean_psk = validate_tv_secret(psk_raw)
+                        valid_host = validate_host(str(merged_tv.get("host") or ""))
+                        pending_psk = (valid_host, clean_psk)
                 oc_patch = patch.get("overclock")
                 if isinstance(oc_patch, dict):
                     merged_oc = dict(merged.get("overclock") or {})
@@ -611,6 +641,10 @@ class SwitchDeckCoordinator:
                         merged[key] = val
             updated = DockProfile.from_dict(merged)
             self.store.put_profile(updated)
+            if pending_psk is not None:
+                set_drv_tok = getattr(self.store, "set_driver_token", None)
+                if callable(set_drv_tok):
+                    set_drv_tok("sony_bravia", pending_psk[0], pending_psk[1])
             self._last_scaling_key = None
             if self.is_docked is True:
                 if self.backend.is_ac_online() and not (
@@ -625,6 +659,131 @@ class SwitchDeckCoordinator:
                 self.reconcile()
             return updated
 
+    def get_profile_payload(self, prof: DockProfile | None = None) -> dict[str, Any]:
+        """Serialize a DockProfile with write-only pairing & TLS cert metadata."""
+        with self._lock:
+            target = prof or self.get_active_profile()
+            payload = target.to_dict()
+            host = target.tv.host
+            driver = target.tv.driver
+            get_drv_tok = getattr(self.store, "get_driver_token", None)
+            if callable(get_drv_tok):
+                paired = bool(host and get_drv_tok(driver, host))
+            else:
+                paired = bool(
+                    host and driver == "samsung_tizen" and self.store.get_token(host)
+                )
+            get_fp = getattr(self.store, "get_cert_fingerprint", None)
+            cert_fp = (
+                get_fp(host)
+                if (host and driver in ("samsung_tizen", "lg_webos") and callable(get_fp))
+                else ""
+            ) or ""
+            payload["tv_paired"] = paired
+            payload["tv_cert_fingerprint"] = cert_fp
+            return payload
+
+    def pair_tv(
+        self,
+        driver_name: str,
+        host: str,
+        port: int = 0,
+        mac: str = "",
+        hdmi_input: str = "",
+        psk: str = "",
+        trust_new_cert: bool = False,
+    ) -> dict[str, Any]:
+        """Pair or verify credentials for Samsung Tizen, LG webOS, or Sony Bravia TV."""
+        with self._lock:
+            drv = (driver_name or "").strip().lower()
+            if drv not in ("samsung_tizen", "lg_webos", "sony_bravia"):
+                raise ValueError(f"Interactive pairing is not supported for TV driver {drv!r}")
+
+            clean_host = validate_host(str(host or "").strip())
+            default_port = DEFAULT_TV_PORTS.get(drv, 8002)
+            clean_port = validate_port(port if port else default_port)
+            clean_mac = validate_mac_address(str(mac or ""))
+            clean_hdmi = (
+                validate_hdmi_input(hdmi_input)
+                if (isinstance(hdmi_input, str) and hdmi_input.strip())
+                else ""
+            )
+            trust = bool(trust_new_cert)
+
+            get_fp = getattr(self.store, "get_cert_fingerprint", None)
+            set_fp = getattr(self.store, "set_cert_fingerprint", None)
+            clear_fp = getattr(self.store, "clear_cert_fingerprint", None)
+            get_drv_tok = getattr(self.store, "get_driver_token", None)
+            set_drv_tok = getattr(self.store, "set_driver_token", None)
+
+            _get_tok = (
+                (lambda h: get_drv_tok(drv, h))
+                if callable(get_drv_tok)
+                else self.store.get_token
+            )
+            _set_tok = (
+                (lambda h, t: set_drv_tok(drv, h, t))
+                if callable(set_drv_tok)
+                else self.store.set_token
+            )
+
+            if trust and drv in ("samsung_tizen", "lg_webos") and callable(clear_fp):
+                clear_fp(clean_host)
+
+            actual_port = clean_port
+            if drv == "samsung_tizen":
+                tv_drv = SamsungTizenDriver(
+                    get_token=_get_tok,
+                    set_token=_set_tok,
+                    get_cert_fingerprint=get_fp,
+                    set_cert_fingerprint=set_fp,
+                )
+                token = tv_drv.pair(clean_host, port=clean_port, trust_new_cert=trust)
+            elif drv == "lg_webos":
+                tv_drv_lg = LgWebOsDriver(
+                    get_token=_get_tok,
+                    set_token=_set_tok,
+                    get_cert_fingerprint=get_fp,
+                    set_cert_fingerprint=set_fp,
+                )
+                token, actual_port = tv_drv_lg.pair_with_port(
+                    clean_host,
+                    port=clean_port,
+                    trust_new_cert=trust,
+                )
+            else:
+                tv_drv_sony = SonyBraviaDriver(get_psk=_get_tok, set_psk=_set_tok)
+                token = tv_drv_sony.pair(clean_host, port=clean_port, psk=psk)
+
+            current_prof = self.get_active_profile()
+            tv_patch: dict[str, Any] = {
+                "driver": drv,
+                "host": clean_host,
+                "port": actual_port,
+            }
+            if clean_mac:
+                tv_patch["mac_address"] = clean_mac
+            elif current_prof.tv.mac_address:
+                tv_patch["mac_address"] = current_prof.tv.mac_address
+            if clean_hdmi:
+                tv_patch["hdmi_input"] = clean_hdmi
+
+            updated_prof = self.update_active_profile({"tv": tv_patch})
+            cert_fp = (
+                get_fp(clean_host)
+                if (drv in ("samsung_tizen", "lg_webos") and callable(get_fp))
+                else ""
+            ) or ""
+            return {
+                "ok": True,
+                "driver": drv,
+                "host": clean_host,
+                "port": actual_port,
+                "token_saved": bool(token),
+                "cert_fingerprint": cert_fp,
+                "profile": self.get_profile_payload(updated_prof),
+            }
+
     def test_active_tv_wake(self) -> bool:
         """Synchronously test waking/switching the active profile's TV."""
         with self._lock:
@@ -635,8 +794,10 @@ class SwitchDeckCoordinator:
                 cec_trigger=self.backend.trigger_hdmi_cec_wake,
                 get_token=self.store.get_token,
                 set_token=self.store.set_token,
-                get_cert_fingerprint=self.store.get_cert_fingerprint,
-                set_cert_fingerprint=self.store.set_cert_fingerprint,
+                get_cert_fingerprint=getattr(self.store, "get_cert_fingerprint", None),
+                set_cert_fingerprint=getattr(self.store, "set_cert_fingerprint", None),
+                get_driver_token=getattr(self.store, "get_driver_token", None),
+                set_driver_token=getattr(self.store, "set_driver_token", None),
             )
             if driver is None:
                 return False

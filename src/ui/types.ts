@@ -1,4 +1,12 @@
-export type TvDriverKind = "cec" | "samsung_tizen" | "roku_ecp" | "webhook" | "none";
+export type TvDriverKind =
+  | "cec"
+  | "samsung_tizen"
+  | "lg_webos"
+  | "sony_bravia"
+  | "roku_ecp"
+  | "wol"
+  | "webhook"
+  | "none";
 
 export interface OutputModeInfo {
   width: number;
@@ -128,6 +136,20 @@ export interface PairSamsungResult {
   error?: string;
 }
 
+export interface PairTvParams {
+  driver: TvDriverKind;
+  host: string;
+  port?: number;
+  mac?: string;
+  hdmiInput?: string;
+  psk?: string;
+  trustNewCert?: boolean;
+}
+
+export interface PairTvResult extends PairSamsungResult {
+  driver?: TvDriverKind;
+}
+
 export interface SwitchDeckTransport {
   getStatus: () => Promise<DaemonStatus>;
   getActiveProfile: () => Promise<DockProfile>;
@@ -142,6 +164,7 @@ export interface SwitchDeckTransport {
     mac?: string,
     trustNewCert?: boolean,
   ) => Promise<PairSamsungResult>;
+  pairTv?: (params: PairTvParams) => Promise<PairTvResult>;
   testTvWake: () => Promise<{ ok: boolean }>;
   applyNativeAppResolution?: (
     width: number,

@@ -132,6 +132,27 @@ class ProfileStore:
             self._profiles[profile.profile_id] = profile
             self.save()
 
+    @staticmethod
+    def _scoped_token_key(driver: str, host: str) -> str:
+        drv = (driver or "").strip().lower()
+        if drv in ("", "samsung_tizen"):
+            return host
+        return f"{drv}:{host}"
+
+    def get_driver_token(self, driver: str, host: str) -> str:
+        with self._lock:
+            key = self._scoped_token_key(driver, host)
+            return self._tokens.get(key, "")
+
+    def set_driver_token(self, driver: str, host: str, token: str) -> None:
+        with self._lock:
+            key = self._scoped_token_key(driver, host)
+            if token == "":
+                self._tokens.pop(key, None)
+            else:
+                self._tokens[key] = token
+            self.save()
+
     def get_token(self, host: str) -> str:
         with self._lock:
             return self._tokens.get(host, "")

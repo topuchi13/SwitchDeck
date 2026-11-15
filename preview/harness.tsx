@@ -280,16 +280,16 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
 
   tv_pairing: {
     key: "tv_pairing",
-    label: "Scaling + Tizen Pairing",
+    label: "LG webOS + Smart TV Bridge",
     resolutionLabel: "1280x800",
-    scrollSection: "scaling",
+    scrollSection: "tv",
     toast: null,
     status: {
       deck_model: "Galileo",
       is_docked: true,
       ac_online: true,
       active_connector: "card1-DP-1",
-      active_edid_id: "SAM_SAMSUNG_S90C_8f31c0a2",
+      active_edid_id: "LGD_LG_TV_4c2019ab",
       selected_output_mode: {
         width: 2560,
         height: 1440,
@@ -322,7 +322,7 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
         enable_vrr: true,
         reason: "Upscaling 1080p game to 1440p120",
       },
-      audio_sink: "HDMI · SAMSUNG S90C",
+      audio_sink: "HDMI · LG OLED C3",
       manual_keep_builtin: false,
       travel_charge_override: false,
       transition_seq: 4,
@@ -335,8 +335,8 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       overclock_status_note: null,
     },
     profile: {
-      profile_id: "SAM_SAMSUNG_S90C_8f31c0a2",
-      display_name: "SAMSUNG S90C",
+      profile_id: "LGD_LG_TV_4c2019ab",
+      display_name: "LG OLED C3",
       preferred_container_width: 1920,
       preferred_container_height: 1080,
       fsr_sharpness: 2,
@@ -348,10 +348,10 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       auto_pause_on_undock: true,
       adaptive_gpu_downscale: true,
       tv: {
-        driver: "samsung_tizen",
-        host: "192.168.1.42",
-        port: 8002,
-        mac_address: "B8:BC:5B:9C:11:2A",
+        driver: "lg_webos",
+        host: "192.168.1.64",
+        port: 3001,
+        mac_address: "A8:23:FE:4D:19:C0",
         hdmi_input: "HDMI2",
         webhook_url: "",
         auto_power_on: true,
@@ -359,7 +359,7 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       },
       tv_paired: true,
       tv_cert_fingerprint:
-        "8f3c9d104b77aa21e8050a1bc9e7c109d3fa44b891003c72fe91a104bcde9012",
+        "4a91c082d6b47e1209f8d3a15c60b724e91f803c2a4b6107d8e9102f3c4a5b6d",
     },
   },
 
@@ -635,14 +635,32 @@ const PreviewApp: FC = () => {
           }),
           ...((patch.overclock as Partial<NonNullable<DockProfile["overclock"]>>) || {}),
         };
+        const tvPatchRaw = {
+          ...((patch.tv as Partial<DockProfile["tv"]> & { psk?: string }) || {}),
+        };
+        const pskSupplied = Boolean(tvPatchRaw.psk && String(tvPatchRaw.psk).trim());
+        delete tvPatchRaw.psk;
+        const driverChanged = Boolean(tvPatchRaw.driver && tvPatchRaw.driver !== profile.tv.driver);
+        const nextTv = {
+          ...profile.tv,
+          ...tvPatchRaw,
+        };
         const nextProf: DockProfile = {
           ...profile,
           ...(patch as Partial<DockProfile>),
-          tv: {
-            ...profile.tv,
-            ...((patch.tv as Partial<DockProfile["tv"]>) || {}),
-          },
+          tv: nextTv,
           overclock: nextOc,
+          tv_paired: pskSupplied
+            ? true
+            : driverChanged
+              ? false
+              : profile.tv_paired,
+          tv_cert_fingerprint:
+            nextTv.driver === "samsung_tizen" || nextTv.driver === "lg_webos"
+              ? driverChanged
+                ? ""
+                : profile.tv_cert_fingerprint
+              : "",
         };
         setProfile(nextProf);
         setStatus((prev) => {
@@ -713,6 +731,39 @@ const PreviewApp: FC = () => {
           port,
           token_saved: true,
           cert_fingerprint: nextProf.tv_cert_fingerprint,
+          profile: nextProf,
+        };
+      },
+      async pairTv({ driver, host, port = 0, mac = "", hdmiInput = "" }) {
+        const defaultPort =
+          driver === "lg_webos" ? 3001 : driver === "sony_bravia" ? 80 : 8002;
+        const resolvedPort = port || defaultPort;
+        const fp =
+          driver === "samsung_tizen" || driver === "lg_webos"
+            ? profile.tv_cert_fingerprint ||
+              "4a91c082d6b47e1209f8d3a15c60b724e91f803c2a4b6107d8e9102f3c4a5b6d"
+            : "";
+        const nextProf: DockProfile = {
+          ...profile,
+          tv: {
+            ...profile.tv,
+            driver,
+            host,
+            port: resolvedPort,
+            mac_address: mac || profile.tv.mac_address,
+            hdmi_input: hdmiInput || profile.tv.hdmi_input,
+          },
+          tv_paired: true,
+          tv_cert_fingerprint: fp,
+        };
+        setProfile(nextProf);
+        return {
+          ok: true,
+          driver,
+          host,
+          port: resolvedPort,
+          token_saved: true,
+          cert_fingerprint: fp,
           profile: nextProf,
         };
       },
@@ -919,7 +970,7 @@ const PreviewApp: FC = () => {
                 borderRadius: "3px",
               }}
             >
-              v0.3.1
+              v0.4.0
             </span>
             <FaEllipsisH size={12} color={COLORS.textSecondary} />
           </div>

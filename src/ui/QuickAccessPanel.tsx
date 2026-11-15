@@ -91,9 +91,31 @@ const CONTAINER_PRESETS: Array<{ key: string; width: number; height: number; lab
 const TV_DRIVER_OPTIONS: DropdownOption[] = [
   { data: "cec", label: "HDMI-CEC (Official Dock)" },
   { data: "samsung_tizen", label: "Samsung Tizen Wi-Fi (S90C)" },
-  { data: "roku_ecp", label: "Roku TV (ECP LAN)" },
+  { data: "lg_webos", label: "LG webOS Wi-Fi (OLED C/G)" },
+  { data: "sony_bravia", label: "Sony Bravia LAN (PSK)" },
+  { data: "roku_ecp", label: "Roku TV LAN (ECP)" },
+  { data: "wol", label: "Wake-on-LAN Only (Any TV)" },
   { data: "webhook", label: "Home Assistant / Webhook" },
   { data: "none", label: "Disabled" },
+];
+
+const DEFAULT_TV_PORTS: Record<TvDriverKind, number> = {
+  cec: 8002,
+  samsung_tizen: 8002,
+  lg_webos: 3001,
+  sony_bravia: 80,
+  roku_ecp: 8060,
+  wol: 9,
+  webhook: 443,
+  none: 8002,
+};
+
+const HDMI_INPUT_OPTIONS: DropdownOption[] = [
+  { data: "HDMI1", label: "HDMI 1" },
+  { data: "HDMI2", label: "HDMI 2" },
+  { data: "HDMI3", label: "HDMI 3" },
+  { data: "HDMI4", label: "HDMI 4" },
+  { data: "AV1", label: "AV 1" },
 ];
 
 function formatDeckModelLabel(model: string): string {
@@ -340,6 +362,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   );
   const [tvHostDraft, setTvHostDraft] = useState<string>(initialProfile?.tv.host ?? "");
   const [tvMacDraft, setTvMacDraft] = useState<string>(initialProfile?.tv.mac_address ?? "");
+  const [tvPskDraft, setTvPskDraft] = useState<string>("");
   const [tvWebhookDraft, setTvWebhookDraft] = useState<string>(
     initialProfile?.tv.webhook_url ?? "",
   );
@@ -573,38 +596,62 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     }
   };
 
-  const handlePairSamsung = async (trustNewCert: boolean) => {
+  const handlePairTv = async (trustNewCert: boolean) => {
+    const driverKind: TvDriverKind = profile?.tv?.driver ?? "samsung_tizen";
     const cleanHost = tvHostDraft.trim();
     if (!cleanHost) {
       setFeedback({ tone: "crimson", text: "Enter TV IP/Hostname before pairing" });
       return;
     }
+    const cleanPsk = tvPskDraft.trim();
+    if (driverKind === "sony_bravia" && !cleanPsk && !profile?.tv_paired) {
+      setFeedback({ tone: "crimson", text: "Enter Sony TV Pre-Shared Key (PSK) before verifying" });
+      return;
+    }
+
     setBusy(true);
     setCertMismatch(false);
     try {
-      const res = await transport.pairSamsungTv(
-        cleanHost,
-        profile?.tv?.port || 8002,
-        tvMacDraft.trim(),
-        trustNewCert,
-      );
+      const targetPort = profile?.tv?.port || DEFAULT_TV_PORTS[driverKind] || 8002;
+      const cleanMac = tvMacDraft.trim();
+      const hdmiInput = profile?.tv?.hdmi_input || "HDMI2";
+      const res = transport.pairTv
+        ? await transport.pairTv({
+            driver: driverKind,
+            host: cleanHost,
+            port: targetPort,
+            mac: cleanMac,
+            hdmiInput,
+            psk: cleanPsk,
+            trustNewCert,
+          })
+        : await transport.pairSamsungTv(cleanHost, targetPort, cleanMac, trustNewCert);
+
       if (res.ok) {
+        if (driverKind === "sony_bravia") {
+          setTvPskDraft("");
+        }
         if (res.profile) {
           syncProfileDrafts(res.profile);
         } else {
           await refreshAll();
         }
-        setFeedback({
-          tone: "sage",
-          text: res.token_saved
+        let msg: string;
+        if (driverKind === "lg_webos") {
+          msg = `LG webOS TV paired & client-key saved (${cleanHost})`;
+        } else if (driverKind === "sony_bravia") {
+          msg = `Sony Bravia PSK verified & saved (${cleanHost})`;
+        } else {
+          msg = res.token_saved
             ? `Samsung TV paired & TLS cert pinned (${cleanHost})`
-            : `Connected to ${cleanHost} — accept Allow prompt on TV`,
-        });
+            : `Connected to ${cleanHost} — accept Allow prompt on TV`;
+        }
+        setFeedback({ tone: "sage", text: msg });
       } else {
         setCertMismatch(Boolean(res.cert_mismatch));
         setFeedback({
           tone: "crimson",
-          text: res.error || "Samsung TV pairing failed",
+          text: res.error || "TV pairing failed",
         });
       }
     } catch (err) {
@@ -622,9 +669,16 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         driver: profile.tv.driver,
         host: tvHostDraft.trim(),
         mac_address: tvMacDraft.trim(),
+        hdmi_input: profile.tv.hdmi_input || "HDMI2",
         webhook_url: tvWebhookDraft.trim(),
       };
+      if (profile.tv.driver === "sony_bravia" && tvPskDraft.trim()) {
+        tvPatch.psk = tvPskDraft.trim();
+      }
       const updated = await transport.updateProfile({ tv: tvPatch });
+      if (profile.tv.driver === "sony_bravia" && tvPskDraft.trim()) {
+        setTvPskDraft("");
+      }
       syncProfileDrafts(updated);
       const res = await transport.testTvWake();
       setFeedback({
@@ -884,19 +938,30 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                   disabled={busy}
                   onChange={(opt) => {
                     const nextDriver = String(opt.data || "none") as TvDriverKind;
+                    setCertMismatch(false);
+                    setTvPskDraft("");
                     void commitProfilePatch(
-                      { tv: { driver: nextDriver } },
+                      {
+                        tv: {
+                          driver: nextDriver,
+                          port: DEFAULT_TV_PORTS[nextDriver] ?? 8002,
+                        },
+                      },
                       `TV driver set to ${opt.label}`,
                     );
                   }}
                 />
               </PanelSectionRow>
 
-              {(activeDriver === "samsung_tizen" || activeDriver === "roku_ecp") && (
+              {(activeDriver === "samsung_tizen" ||
+                activeDriver === "lg_webos" ||
+                activeDriver === "sony_bravia" ||
+                activeDriver === "roku_ecp" ||
+                activeDriver === "wol") && (
                 <PanelSectionRow>
                   <TextField
-                    label="TV Host / IP"
-                    placeholder="192.168.1.50"
+                    label={activeDriver === "wol" ? "Broadcast IP (Optional)" : "TV Host / IP"}
+                    placeholder={activeDriver === "wol" ? "255.255.255.255" : "192.168.1.50"}
                     value={tvHostDraft}
                     disabled={busy}
                     onChange={(e) => setTvHostDraft(e.target.value)}
@@ -904,92 +969,180 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 </PanelSectionRow>
               )}
 
-              {activeDriver === "samsung_tizen" && (
-                <>
-                  <PanelSectionRow>
-                    <TextField
-                      label="TV MAC (WoL)"
-                      placeholder="AA:BB:CC:DD:EE:FF"
-                      value={tvMacDraft}
-                      disabled={busy}
-                      onChange={(e) => setTvMacDraft(e.target.value)}
-                    />
-                  </PanelSectionRow>
+              {(activeDriver === "samsung_tizen" ||
+                activeDriver === "lg_webos" ||
+                activeDriver === "sony_bravia" ||
+                activeDriver === "roku_ecp" ||
+                activeDriver === "wol") && (
+                <PanelSectionRow>
+                  <TextField
+                    label="TV MAC (WoL)"
+                    placeholder="AA:BB:CC:DD:EE:FF"
+                    value={tvMacDraft}
+                    disabled={busy}
+                    onChange={(e) => setTvMacDraft(e.target.value)}
+                  />
+                </PanelSectionRow>
+              )}
 
-                  {(hasCertPin || profile.tv_paired) && (
-                    <PanelSectionRow>
-                      <div style={qamStyles.certCard}>
-                        <div
+              {(activeDriver === "lg_webos" ||
+                activeDriver === "sony_bravia" ||
+                activeDriver === "roku_ecp" ||
+                activeDriver === "webhook") && (
+                <PanelSectionRow>
+                  <DropdownItem
+                    label="HDMI Input"
+                    rgOptions={HDMI_INPUT_OPTIONS}
+                    selectedOption={profile.tv.hdmi_input || "HDMI2"}
+                    disabled={busy}
+                    onChange={(opt) => {
+                      const nextInput = String(opt.data || "HDMI2");
+                      void commitProfilePatch(
+                        { tv: { hdmi_input: nextInput } },
+                        `TV HDMI input set to ${opt.label}`,
+                      );
+                    }}
+                  />
+                </PanelSectionRow>
+              )}
+
+              {activeDriver === "sony_bravia" && (
+                <PanelSectionRow>
+                  <TextField
+                    label="Pre-Shared Key (PSK)"
+                    placeholder={
+                      profile.tv_paired
+                        ? "Saved (enter new PSK to replace)"
+                        : "Set in TV Network -> IP Control"
+                    }
+                    value={tvPskDraft}
+                    disabled={busy}
+                    onChange={(e) => setTvPskDraft(e.target.value)}
+                  />
+                </PanelSectionRow>
+              )}
+
+              {(activeDriver === "samsung_tizen" || activeDriver === "lg_webos") &&
+                (hasCertPin || profile.tv_paired) && (
+                  <PanelSectionRow>
+                    <div style={qamStyles.certCard}>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span
                           style={{
-                            display: "flex",
+                            display: "inline-flex",
                             alignItems: "center",
-                            justifyContent: "space-between",
-                            gap: "6px",
-                            flexWrap: "wrap",
+                            gap: "5px",
+                            fontSize: "11px",
+                            fontWeight: 700,
+                            color: COLORS.sage,
                           }}
                         >
-                          <span
-                            style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              gap: "5px",
-                              fontSize: "11px",
-                              fontWeight: 700,
-                              color: COLORS.sage,
-                            }}
-                          >
-                            <FaShieldAlt size={11} />
-                            <span>TLS Cert Pin Active</span>
-                          </span>
-                          <div style={{ display: "flex", gap: "4px" }}>
-                            {profile.tv_paired && (
-                              <span style={qamStyles.pill("sage")}>
-                                <FaCheckCircle size={9} />
-                                <span>Paired</span>
-                              </span>
-                            )}
-                            {hasCertPin && (
-                              <span style={qamStyles.pill("steel")}>
-                                <FaLock size={9} />
-                                <span>TOFU Pinned</span>
-                              </span>
-                            )}
-                          </div>
+                          <FaShieldAlt size={11} />
+                          <span>{hasCertPin ? "TLS Cert Pin Active" : "WebSocket Paired"}</span>
+                        </span>
+                        <div style={{ display: "flex", gap: "4px" }}>
+                          {profile.tv_paired && (
+                            <span style={qamStyles.pill("sage")}>
+                              <FaCheckCircle size={9} />
+                              <span>Paired</span>
+                            </span>
+                          )}
+                          {hasCertPin && (
+                            <span style={qamStyles.pill("steel")}>
+                              <FaLock size={9} />
+                              <span>TOFU Pinned</span>
+                            </span>
+                          )}
                         </div>
-                        {profile.tv_cert_fingerprint && (
-                          <span style={qamStyles.monoCode}>
-                            sha256: {shortFingerprint(profile.tv_cert_fingerprint)}
-                          </span>
-                        )}
                       </div>
-                    </PanelSectionRow>
-                  )}
+                      {profile.tv_cert_fingerprint && (
+                        <span style={qamStyles.monoCode}>
+                          sha256: {shortFingerprint(profile.tv_cert_fingerprint)}
+                        </span>
+                      )}
+                    </div>
+                  </PanelSectionRow>
+                )}
 
-                  {certMismatch && (
-                    <PanelSectionRow>
-                      <ButtonItem
-                        layout="below"
-                        disabled={busy}
-                        onClick={() => void handlePairSamsung(true)}
+              {activeDriver === "sony_bravia" && profile.tv_paired && (
+                <PanelSectionRow>
+                  <div style={qamStyles.certCard}>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "5px",
+                          fontSize: "11px",
+                          fontWeight: 700,
+                          color: COLORS.sage,
+                        }}
                       >
-                        Trust New TV Cert & Re-Pair
-                      </ButtonItem>
-                    </PanelSectionRow>
-                  )}
+                        <FaShieldAlt size={11} />
+                        <span>Pre-Shared Key Configured</span>
+                      </span>
+                      <span style={qamStyles.pill("sage")}>
+                        <FaCheckCircle size={9} />
+                        <span>PSK Saved</span>
+                      </span>
+                    </div>
+                    <span style={qamStyles.statSub}>
+                      Stored in 0600 tv_tokens.json (never sent back to UI)
+                    </span>
+                  </div>
+                </PanelSectionRow>
+              )}
 
+              {certMismatch &&
+                (activeDriver === "samsung_tizen" || activeDriver === "lg_webos") && (
                   <PanelSectionRow>
                     <ButtonItem
                       layout="below"
                       disabled={busy}
-                      onClick={() => void handlePairSamsung(false)}
+                      onClick={() => void handlePairTv(true)}
                     >
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaWifi size={11} color={COLORS.accent} />
-                        <span>Pair Samsung TV</span>
-                      </span>
+                      Trust New TV Cert &amp; Re-Pair
                     </ButtonItem>
                   </PanelSectionRow>
-                </>
+                )}
+
+              {(activeDriver === "samsung_tizen" ||
+                activeDriver === "lg_webos" ||
+                activeDriver === "sony_bravia") && (
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    disabled={busy}
+                    onClick={() => void handlePairTv(false)}
+                  >
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                      <FaWifi size={11} color={COLORS.accent} />
+                      <span>
+                        {activeDriver === "lg_webos"
+                          ? "Pair LG webOS TV"
+                          : activeDriver === "sony_bravia"
+                            ? "Save & Verify Sony PSK"
+                            : "Pair Samsung TV"}
+                      </span>
+                    </span>
+                  </ButtonItem>
+                </PanelSectionRow>
               )}
 
               {activeDriver === "webhook" && (

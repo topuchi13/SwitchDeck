@@ -222,6 +222,9 @@ class Plugin:
                 await self._safe_reconcile()
 
     def _profile_payload(self, coord: SwitchDeckCoordinator, prof: DockProfile) -> dict[str, Any]:
+        get_payload = getattr(coord, "get_profile_payload", None)
+        if callable(get_payload):
+            return get_payload(prof)
         payload = prof.to_dict()
         host = prof.tv.host
         get_token = getattr(coord.store, "get_token", None)
@@ -382,6 +385,42 @@ class Plugin:
         async with self._get_lock():
             try:
                 return await asyncio.to_thread(_do_pair)
+            except ssl.SSLCertVerificationError as exc:
+                return {
+                    "ok": False,
+                    "cert_mismatch": True,
+                    "error": str(exc),
+                }
+            except (ValueError, OSError, ConnectionError) as exc:
+                return {
+                    "ok": False,
+                    "cert_mismatch": False,
+                    "error": str(exc),
+                }
+
+    async def pair_tv(
+        self,
+        driver: str,
+        host: str,
+        port: int = 0,
+        mac: str = "",
+        hdmi_input: str = "",
+        psk: str = "",
+        trust_new_cert: bool = False,
+    ) -> dict[str, Any]:
+        coord = self._ensure_coordinator()
+        async with self._get_lock():
+            try:
+                return await asyncio.to_thread(
+                    coord.pair_tv,
+                    driver,
+                    host,
+                    int(port or 0),
+                    str(mac or ""),
+                    str(hdmi_input or ""),
+                    str(psk or ""),
+                    bool(trust_new_cert),
+                )
             except ssl.SSLCertVerificationError as exc:
                 return {
                     "ok": False,
