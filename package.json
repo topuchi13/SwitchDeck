@@ -15,8 +15,7 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "preview": "rollup -c preview/rollup.preview.mjs",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.preview.json --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@decky/api": "^1.1.3",

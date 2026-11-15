@@ -18,16 +18,16 @@ Run the simulated LCD `Jupiter` + USB-C hub + sleeping 2.4GHz Xbox dongle + Sams
 PYTHONPATH=src python3 -m switchdeck.cli demo
 ```
 
-Run the full automated verification suite (**39 `unittest` cases**):
+Run the full automated verification suite (**46 `unittest` cases**):
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Build the Decky frontend, preview bundle, and installable Decky Loader ZIP:
+Build the Decky frontend and installable Decky Loader ZIP:
 
 ```bash
-npm run typecheck && npm run build && npm run preview && ./scripts/build_decky_zip.sh
+npm run typecheck && npm run build && ./scripts/build_decky_zip.sh
 ```
 
 ---

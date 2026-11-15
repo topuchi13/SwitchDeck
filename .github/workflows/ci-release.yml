@@ -43,7 +43,7 @@ jobs:
         run: PYTHONPATH=src python3 -m unittest discover -s tests -v
 
       - name: Check shell script syntax
-        run: bash -n scripts/*.sh preview/capture_screenshots.sh
+        run: bash -n scripts/*.sh
 
       - name: Upload release artifact
         if: startsWith(github.ref, 'refs/tags/v')
