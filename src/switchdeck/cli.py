@@ -39,6 +39,12 @@ def _run_doctor() -> int:
     status = coord.reconcile()
     print(f"Deck Model        : {status.deck_model.value}")
     print(f"Docked            : {status.is_docked} (connector={status.active_connector}, ac={status.ac_online})")
+    print(
+        f"APU Temp / SMU Max: "
+        f"{f'{status.apu_temp_c:.1f}C' if status.apu_temp_c is not None else 'n/a'} / {status.hw_max_tdp_watts}W"
+    )
+    if status.overclock_active or status.overclock_status_note:
+        print(f"Docked Overclock  : active={status.overclock_active} ({status.overclock_status_note or 'idle'})")
     print(f"Active EDID       : {status.active_edid_id}")
     print(f"Selected Output   : {status.selected_output_mode.label if status.selected_output_mode else 'handheld'}")
     print(f"Built-in 28de:1205: {'BOUND (active)' if status.builtin_controller_bound else 'UNBOUND (external P1)'}")

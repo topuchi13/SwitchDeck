@@ -12,7 +12,7 @@ import type {
   TransitionPayload,
 } from "../src/ui/types";
 
-type ScenarioKey = "handheld" | "docked_s90c" | "docked_warning" | "tv_pairing";
+type ScenarioKey = "handheld" | "docked_s90c" | "docked_warning" | "tv_pairing" | "docked_overclock";
 
 interface ScenarioData {
   key: ScenarioKey;
@@ -21,7 +21,7 @@ interface ScenarioData {
   status: DaemonStatus;
   profile: DockProfile;
   toast: TransitionPayload | null;
-  scrollSection: "top" | "scaling" | "tv";
+  scrollSection: "top" | "scaling" | "tv" | "overclock";
 }
 
 const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
@@ -60,6 +60,11 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       transition_seq: 1,
       last_transition: null,
       last_error: null,
+      apu_temp_c: 48.0,
+      hw_max_tdp_watts: 19,
+      overclock_active: false,
+      overclock_thermal_throttled: false,
+      overclock_status_note: null,
     },
     profile: {
       profile_id: "default",
@@ -148,6 +153,11 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       transition_seq: 2,
       last_transition: null,
       last_error: null,
+      apu_temp_c: 62.0,
+      hw_max_tdp_watts: 22,
+      overclock_active: false,
+      overclock_thermal_throttled: false,
+      overclock_status_note: null,
     },
     profile: {
       profile_id: "SAM_SAMSUNG_S90C_8f31c0a2",
@@ -236,6 +246,11 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       transition_seq: 3,
       last_transition: null,
       last_error: null,
+      apu_temp_c: 64.0,
+      hw_max_tdp_watts: 19,
+      overclock_active: false,
+      overclock_thermal_throttled: false,
+      overclock_status_note: null,
     },
     profile: {
       profile_id: "LGD_LG_TV_4c2019ab",
@@ -313,6 +328,11 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
       transition_seq: 4,
       last_transition: null,
       last_error: null,
+      apu_temp_c: 59.0,
+      hw_max_tdp_watts: 22,
+      overclock_active: false,
+      overclock_thermal_throttled: false,
+      overclock_status_note: null,
     },
     profile: {
       profile_id: "SAM_SAMSUNG_S90C_8f31c0a2",
@@ -336,6 +356,110 @@ const SCENARIOS: Record<ScenarioKey, ScenarioData> = {
         webhook_url: "",
         auto_power_on: true,
         auto_switch_input: true,
+      },
+      tv_paired: true,
+      tv_cert_fingerprint:
+        "8f3c9d104b77aa21e8050a1bc9e7c109d3fa44b891003c72fe91a104bcde9012",
+    },
+  },
+
+  docked_overclock: {
+    key: "docked_overclock",
+    label: "Docked OC (20W)",
+    resolutionLabel: "1920x1080",
+    scrollSection: "overclock",
+    toast: {
+      seq: 5,
+      kind: "docked",
+      display_name: "SAMSUNG S90C",
+      output_mode: "2560x1440@120Hz",
+      vrr_enabled: true,
+      p1_controller: "Xbox Wireless Controller",
+      scaling_summary: "1080p · FSR (Sharp 2)",
+      tdp_watts: 20,
+      charge_limit: 80,
+      audio_sink: "HDMI · SAMSUNG S90C",
+      overclock_active: true,
+    },
+    status: {
+      deck_model: "Galileo",
+      is_docked: true,
+      ac_online: true,
+      active_connector: "card1-DP-1",
+      active_edid_id: "SAM_SAMSUNG_S90C_8f31c0a2",
+      selected_output_mode: {
+        width: 2560,
+        height: 1440,
+        refresh_hz: 120,
+        preferred: true,
+      },
+      builtin_controller_bound: false,
+      active_controllers: [
+        {
+          input_name: "input14",
+          name: "Xbox Wireless Controller (2.4GHz)",
+          vendor_id: "045e",
+          product_id: "02ea",
+          transport: "dongle_24g",
+          is_actively_awake: true,
+          wakeup_count: 1,
+        },
+      ],
+      sleeping_controllers: [],
+      unhandled_dongles: [],
+      lcd_bluetooth_wakeup_enabled: false,
+      charge_limit: 80,
+      tdp_watts: 20,
+      last_scaling: {
+        target_width: 1920,
+        target_height: 1080,
+        scaling_filter: "FSR",
+        scaling_scaler: "FIT",
+        fsr_sharpness: 2,
+        enable_vrr: true,
+        reason: "Upscaling 1080p game to 1440p120",
+      },
+      audio_sink: "HDMI · SAMSUNG S90C",
+      manual_keep_builtin: false,
+      travel_charge_override: false,
+      transition_seq: 5,
+      last_transition: null,
+      last_error: null,
+      apu_temp_c: 71.0,
+      hw_max_tdp_watts: 22,
+      overclock_active: true,
+      overclock_thermal_throttled: false,
+      overclock_status_note: "Active: 20W sustained · GPU 400-1800 MHz · CPU Boost On",
+    },
+    profile: {
+      profile_id: "SAM_SAMSUNG_S90C_8f31c0a2",
+      display_name: "SAMSUNG S90C",
+      preferred_container_width: 1920,
+      preferred_container_height: 1080,
+      fsr_sharpness: 2,
+      docked_tdp_watts: 15,
+      handheld_tdp_watts: 11,
+      docked_charge_limit: 80,
+      docked_volume: 0.65,
+      handheld_volume: 0.5,
+      auto_pause_on_undock: true,
+      adaptive_gpu_downscale: true,
+      tv: {
+        driver: "samsung_tizen",
+        host: "192.168.1.42",
+        port: 8002,
+        mac_address: "B8:BC:5B:9C:11:2A",
+        hdmi_input: "HDMI2",
+        webhook_url: "",
+        auto_power_on: true,
+        auto_switch_input: true,
+      },
+      overclock: {
+        risk_acknowledged: true,
+        enabled: true,
+        boost_tdp_watts: 20,
+        gpu_max_mhz: 1800,
+        cpu_boost: true,
       },
       tv_paired: true,
       tv_cert_fingerprint:
@@ -480,6 +604,16 @@ const PreviewApp: FC = () => {
         return profile;
       },
       async updateProfile(patch) {
+        const nextOc = {
+          ...(profile.overclock ?? {
+            risk_acknowledged: false,
+            enabled: false,
+            boost_tdp_watts: 18,
+            gpu_max_mhz: 0,
+            cpu_boost: true,
+          }),
+          ...((patch.overclock as Partial<NonNullable<DockProfile["overclock"]>>) || {}),
+        };
         const nextProf: DockProfile = {
           ...profile,
           ...(patch as Partial<DockProfile>),
@@ -487,12 +621,29 @@ const PreviewApp: FC = () => {
             ...profile.tv,
             ...((patch.tv as Partial<DockProfile["tv"]>) || {}),
           },
+          overclock: nextOc,
         };
         setProfile(nextProf);
-        setStatus((prev) => ({
-          ...prev,
-          tdp_watts: prev.is_docked ? nextProf.docked_tdp_watts : nextProf.handheld_tdp_watts,
-        }));
+        setStatus((prev) => {
+          const ocActive = Boolean(
+            nextOc.risk_acknowledged && nextOc.enabled && prev.is_docked && prev.ac_online,
+          );
+          const nextTdp = ocActive
+            ? nextOc.boost_tdp_watts
+            : prev.is_docked
+              ? nextProf.docked_tdp_watts
+              : nextProf.handheld_tdp_watts;
+          const gpuNote =
+            nextOc.gpu_max_mhz >= 1600 ? `GPU 400-${nextOc.gpu_max_mhz} MHz` : "GPU Stock Auto";
+          return {
+            ...prev,
+            tdp_watts: nextTdp,
+            overclock_active: ocActive,
+            overclock_status_note: ocActive
+              ? `Active: ${nextOc.boost_tdp_watts}W sustained · ${gpuNote} · CPU Boost ${nextOc.cpu_boost ? "On" : "Off"}`
+              : null,
+          };
+        });
         return nextProf;
       },
       async setKeepBuiltin(enabled) {
@@ -626,6 +777,7 @@ const PreviewApp: FC = () => {
           position: "absolute",
           bottom: "44px",
           left: "24px",
+          right: "380px",
           display: "flex",
           flexWrap: "wrap",
           gap: "6px",
@@ -735,7 +887,7 @@ const PreviewApp: FC = () => {
                 borderRadius: "4px",
               }}
             >
-              v0.2.0
+              v0.3.0
             </span>
             <FaEllipsisH size={12} color={COLORS.textSecondary} />
           </div>

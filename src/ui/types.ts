@@ -48,6 +48,7 @@ export interface TransitionPayload {
   tdp_watts: number | null;
   charge_limit: number;
   audio_sink: string | null;
+  overclock_active?: boolean;
 }
 
 export interface DaemonStatus {
@@ -71,6 +72,11 @@ export interface DaemonStatus {
   transition_seq: number;
   last_transition: TransitionPayload | null;
   last_error: string | null;
+  apu_temp_c?: number | null;
+  hw_max_tdp_watts?: number;
+  overclock_active?: boolean;
+  overclock_thermal_throttled?: boolean;
+  overclock_status_note?: string | null;
 }
 
 export interface TvDriverConfig {
@@ -82,6 +88,14 @@ export interface TvDriverConfig {
   webhook_url: string;
   auto_power_on: boolean;
   auto_switch_input: boolean;
+}
+
+export interface DockedOverclockConfig {
+  risk_acknowledged: boolean;
+  enabled: boolean;
+  boost_tdp_watts: number;
+  gpu_max_mhz: number;
+  cpu_boost: boolean;
 }
 
 export interface DockProfile {
@@ -98,6 +112,7 @@ export interface DockProfile {
   auto_pause_on_undock: boolean;
   adaptive_gpu_downscale: boolean;
   tv: TvDriverConfig;
+  overclock?: DockedOverclockConfig;
   tv_paired?: boolean;
   tv_cert_fingerprint?: string;
 }

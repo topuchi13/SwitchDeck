@@ -34,6 +34,11 @@ class MockHardwareBackend:
     tdp_watts: int = 11
     gpu_level: str = "auto"
     charge_limit: int = -1
+    apu_temp_c: float | None = 56.0
+    hw_max_tdp_watts: int = 22
+    overclock_applied: bool = False
+    gpu_max_mhz: int = 0
+    cpu_boost: bool = True
     active_game: GameWindowState | None = None
     wireplumber_keepalive_written: bool = False
     paused_pids: set[int] = field(default_factory=set)
@@ -204,6 +209,34 @@ class MockHardwareBackend:
     def set_gpu_performance_auto(self) -> bool:
         self.gpu_level = "auto"
         self.events_log.append("steamosctl:set-gpu-performance-level auto")
+        return True
+
+    def get_apu_temperature_c(self) -> float | None:
+        return self.apu_temp_c
+
+    def get_max_sustained_tdp_watts(self) -> int:
+        return max(15, min(30, int(self.hw_max_tdp_watts)))
+
+    def apply_docked_overclock(self, watts: int, gpu_max_mhz: int, cpu_boost: bool) -> bool:
+        clamped_w = max(3, min(22, int(watts), self.get_max_sustained_tdp_watts()))
+        self.overclock_applied = True
+        self.tdp_watts = clamped_w
+        self.gpu_max_mhz = int(gpu_max_mhz)
+        self.cpu_boost = bool(cpu_boost)
+        self.gpu_level = "manual" if self.gpu_max_mhz >= 1600 else "auto"
+        self.events_log.append(
+            f"overclock:apply tdp={clamped_w}W gpu_max={self.gpu_max_mhz}MHz cpu_boost={int(self.cpu_boost)}"
+        )
+        return True
+
+    def reset_docked_overclock(self, fallback_tdp_watts: int = 15) -> bool:
+        safe_w = max(3, min(15, int(fallback_tdp_watts)))
+        self.overclock_applied = False
+        self.tdp_watts = safe_w
+        self.gpu_max_mhz = 0
+        self.cpu_boost = True
+        self.gpu_level = "auto"
+        self.events_log.append(f"overclock:reset tdp={safe_w}W gpu=auto cpu_boost=1")
         return True
 
     def set_charge_limit(self, percent: int) -> bool:

@@ -205,6 +205,32 @@ class ScalingDecision:
     reason: str = ""
 
 
+STOCK_MAX_TDP_WATTS = 15
+HARD_MAX_OVERCLOCK_TDP_WATTS = 22
+MIN_OVERCLOCK_GPU_MHZ = 1600
+MAX_OVERCLOCK_GPU_MHZ = 2000
+THERMAL_THROTTLE_TRIGGER_C = 90.0
+THERMAL_THROTTLE_RECOVER_C = 80.0
+
+
+def _clamp_gpu_max_mhz(value: Any, default: int = 0) -> int:
+    """Allow 0 (Stock Auto) or clamp manual GPU ceiling into [1600, 2000] MHz."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return default
+        parsed = int(round(value))
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+    if parsed <= 0:
+        return 0
+    return max(MIN_OVERCLOCK_GPU_MHZ, min(MAX_OVERCLOCK_GPU_MHZ, parsed))
+
+
 @dataclass
 class TvDriverConfig:
     """Per-dock TV control settings (supports CEC + LAN Smart TVs)."""
@@ -217,6 +243,40 @@ class TvDriverConfig:
     webhook_url: str = ""
     auto_power_on: bool = True
     auto_switch_input: bool = True
+
+
+@dataclass
+class DockedOverclockConfig:
+    """Volatile runtime-only docked performance tuning (zero BIOS/voltage writes)."""
+
+    risk_acknowledged: bool = False
+    enabled: bool = False
+    boost_tdp_watts: int = 18
+    gpu_max_mhz: int = 0  # 0 = Stock Auto (1600 MHz); >0 clamped to [1600, 2000]
+    cpu_boost: bool = True
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> DockedOverclockConfig:
+        if not isinstance(raw, dict):
+            return cls()
+        risk_ack = raw.get("risk_acknowledged") is True
+        enabled = raw.get("enabled") is True
+        cpu_boost_raw = raw.get("cpu_boost")
+        cpu_boost = cpu_boost_raw if isinstance(cpu_boost_raw, bool) else cls.cpu_boost
+        boost_tdp = _clamp_int(
+            raw.get("boost_tdp_watts"),
+            STOCK_MAX_TDP_WATTS,
+            HARD_MAX_OVERCLOCK_TDP_WATTS,
+            cls.boost_tdp_watts,
+        )
+        gpu_max = _clamp_gpu_max_mhz(raw.get("gpu_max_mhz"), cls.gpu_max_mhz)
+        return cls(
+            risk_acknowledged=risk_ack,
+            enabled=enabled,
+            boost_tdp_watts=boost_tdp,
+            gpu_max_mhz=gpu_max,
+            cpu_boost=cpu_boost,
+        )
 
 
 _INT_CLAMPS: dict[str, tuple[int, int, int]] = {
@@ -250,6 +310,7 @@ class DockProfile:
     auto_pause_on_undock: bool = True
     adaptive_gpu_downscale: bool = True
     tv: TvDriverConfig = field(default_factory=TvDriverConfig)
+    overclock: DockedOverclockConfig = field(default_factory=DockedOverclockConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -262,10 +323,11 @@ class DockProfile:
         tv = TvDriverConfig(
             **{k: v for k, v in tv_raw.items() if k in TvDriverConfig.__dataclass_fields__}
         )
+        overclock = DockedOverclockConfig.from_dict(data.get("overclock"))
         kwargs: dict[str, Any] = {
             k: v
             for k, v in data.items()
-            if k in cls.__dataclass_fields__ and k != "tv"
+            if k in cls.__dataclass_fields__ and k not in ("tv", "overclock")
         }
         kwargs.setdefault("profile_id", "default")
         for key, (lo, hi, default) in _INT_CLAMPS.items():
@@ -278,7 +340,7 @@ class DockProfile:
             kwargs["docked_charge_limit"] = _clamp_charge_limit(
                 kwargs["docked_charge_limit"], cls.docked_charge_limit
             )
-        return cls(tv=tv, **kwargs)
+        return cls(tv=tv, overclock=overclock, **kwargs)
 
 
 @dataclass
@@ -305,6 +367,11 @@ class DaemonStatus:
     transition_seq: int = 0
     last_transition: dict[str, Any] | None = None
     last_error: str | None = None
+    apu_temp_c: float | None = None
+    hw_max_tdp_watts: int = STOCK_MAX_TDP_WATTS
+    overclock_active: bool = False
+    overclock_thermal_throttled: bool = False
+    overclock_status_note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

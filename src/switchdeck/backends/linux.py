@@ -26,9 +26,14 @@ from ..domain import (
 )
 from ..edid import parse_edid
 from ..security import (
+    apply_runtime_overclock_sysfs,
+    find_validated_amdgpu_device,
+    find_validated_amdgpu_hwmon,
+    reset_runtime_overclock_sysfs,
     safe_write_sysfs,
     validate_game_pid,
     validate_neptune_iface,
+    validate_overclock_args,
     validate_wakeup_path,
 )
 from ..session import UserSessionContext, resolve_user_session
@@ -562,6 +567,66 @@ class LinuxHardwareBackend:
     def set_gpu_performance_auto(self) -> bool:
         rc, _ = self.session.run_user_cmd(["steamosctl", "set-gpu-performance-level", "auto"])
         return rc == 0
+
+    def get_apu_temperature_c(self) -> float | None:
+        dev_dir = find_validated_amdgpu_device()
+        if dev_dir is None:
+            return None
+        hwmon = find_validated_amdgpu_hwmon(dev_dir)
+        if hwmon is None:
+            return None
+        raw = _read_text(hwmon / "temp1_input")
+        if raw.isdigit():
+            return round(int(raw) / 1000.0, 1)
+        return None
+
+    def get_max_sustained_tdp_watts(self) -> int:
+        dev_dir = find_validated_amdgpu_device()
+        if dev_dir is None:
+            return 15
+        hwmon = find_validated_amdgpu_hwmon(dev_dir)
+        if hwmon is None:
+            return 15
+        raw = _read_text(hwmon / "power1_cap_max")
+        if raw.isdigit():
+            watts = int(raw) // 1_000_000
+            return max(15, min(30, watts))
+        return 15
+
+    def apply_docked_overclock(self, watts: int, gpu_max_mhz: int, cpu_boost: bool) -> bool:
+        try:
+            watts_val, gpu_mhz, boost_flag = validate_overclock_args(watts, gpu_max_mhz, cpu_boost)
+        except ValueError:
+            return False
+        self.session.run_user_cmd(["steamosctl", "set-tdp-limit", str(min(watts_val, 15))])
+        if os.geteuid() == 0:
+            return apply_runtime_overclock_sysfs(watts_val, gpu_mhz, boost_flag)
+        if HELPER_PATH.exists():
+            rc, _ = _run_cmd(
+                [
+                    "sudo",
+                    "-n",
+                    str(HELPER_PATH),
+                    "apply-overclock",
+                    str(watts_val),
+                    str(gpu_mhz),
+                    "1" if boost_flag else "0",
+                ]
+            )
+            return rc == 0
+        return False
+
+    def reset_docked_overclock(self, fallback_tdp_watts: int = 15) -> bool:
+        safe_watts = max(3, min(15, int(fallback_tdp_watts)))
+        sys_ok = False
+        if os.geteuid() == 0:
+            sys_ok = reset_runtime_overclock_sysfs(safe_watts)
+        elif HELPER_PATH.exists():
+            rc_help, _ = _run_cmd(["sudo", "-n", str(HELPER_PATH), "reset-overclock", str(safe_watts)])
+            sys_ok = rc_help == 0
+        rc_tdp, _ = self.session.run_user_cmd(["steamosctl", "set-tdp-limit", str(safe_watts)])
+        self.session.run_user_cmd(["steamosctl", "set-gpu-performance-level", "auto"])
+        return sys_ok or rc_tdp == 0
 
     def set_charge_limit(self, percent: int) -> bool:
         rc, _ = self.session.run_user_cmd(["steamosctl", "set-max-charge-level", str(int(percent))])

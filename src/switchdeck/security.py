@@ -272,3 +272,274 @@ def atomic_write_json(
                 os.unlink(tmp_name)
             except OSError:
                 pass
+
+
+def _resolve_under_root(target: str | Path, root_real: str) -> Path | None:
+    """Resolve target via realpath and verify strict confinement under root_real."""
+    if not target or "\x00" in str(target):
+        return None
+    try:
+        real = os.path.realpath(str(target))
+    except (OSError, ValueError, TypeError):
+        return None
+    if real != root_real.rstrip("/") and not real.startswith(root_real):
+        return None
+    return Path(real)
+
+
+def _normalized_sys_root(sys_devices_root: str) -> str | None:
+    if not sys_devices_root or "\x00" in sys_devices_root:
+        return None
+    try:
+        root_real = os.path.realpath(sys_devices_root)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not root_real.endswith("/"):
+        root_real += "/"
+    if root_real == "/":
+        return None
+    return root_real
+
+
+def find_validated_amdgpu_device(
+    drm_root: Path = Path("/sys/class/drm"),
+    sys_devices_root: str = "/sys/devices/",
+) -> Path | None:
+    """Locate AMD GPU sysfs device directory (vendor 0x1002) confined under sys_devices_root."""
+    root_real = _normalized_sys_root(sys_devices_root)
+    if root_real is None:
+        return None
+    try:
+        candidates = sorted(drm_root.glob("card*/device"))
+    except OSError:
+        return None
+    for candidate in candidates:
+        real_dev = _resolve_under_root(candidate, root_real)
+        if real_dev is None:
+            continue
+        try:
+            vendor = (real_dev / "vendor").read_text(encoding="utf-8", errors="replace").strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x1002":
+            return real_dev
+    return None
+
+
+def find_validated_amdgpu_hwmon(
+    dev_dir: Path,
+    sys_devices_root: str = "/sys/devices/",
+) -> Path | None:
+    """Locate validated amdgpu hwmon directory strictly inside dev_dir and sys_devices_root."""
+    root_real = _normalized_sys_root(sys_devices_root)
+    if root_real is None:
+        return None
+    real_dev = _resolve_under_root(dev_dir, root_real)
+    if real_dev is None:
+        return None
+    dev_prefix = os.fspath(real_dev).rstrip("/") + "/"
+    try:
+        hwmons = sorted((real_dev / "hwmon").glob("hwmon*"))
+    except OSError:
+        return None
+    for candidate in hwmons:
+        real_hw = _resolve_under_root(candidate, dev_prefix)
+        if real_hw is None or not os.fspath(real_hw).startswith(root_real):
+            continue
+        name_path = real_hw / "name"
+        if name_path.exists():
+            try:
+                name_val = name_path.read_text(encoding="utf-8", errors="replace").strip().lower()
+            except OSError:
+                continue
+            if name_val != "amdgpu":
+                continue
+        return real_hw
+    return None
+
+
+def validate_overclock_args(watts: Any, gpu_max_mhz: Any, cpu_boost: Any) -> tuple[int, int, bool]:
+    """Validate volatile runtime overclock bounds: 3..22W, GPU 0|1600..2000MHz, bool boost."""
+    if isinstance(watts, (bool, float)):
+        raise ValueError(f"Invalid watts type: {type(watts).__name__}")
+    try:
+        watts_val = int(watts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid watts value: {watts!r}") from exc
+    if watts_val < 3 or watts_val > 22:
+        raise ValueError(f"Watts out of safe bounds (3..22): {watts_val}")
+
+    if isinstance(gpu_max_mhz, (bool, float)):
+        raise ValueError(f"Invalid gpu_max_mhz type: {type(gpu_max_mhz).__name__}")
+    try:
+        gpu_val = int(gpu_max_mhz)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid gpu_max_mhz value: {gpu_max_mhz!r}") from exc
+    if gpu_val != 0 and (gpu_val < 1600 or gpu_val > 2000):
+        raise ValueError(f"gpu_max_mhz must be 0 or 1600..2000: {gpu_val}")
+
+    if isinstance(cpu_boost, bool):
+        boost_val = cpu_boost
+    elif isinstance(cpu_boost, int) and cpu_boost in (0, 1):
+        boost_val = bool(cpu_boost)
+    elif isinstance(cpu_boost, str) and cpu_boost in ("0", "1"):
+        boost_val = cpu_boost == "1"
+    else:
+        raise ValueError(f"cpu_boost must be boolean or 0/1, got: {cpu_boost!r}")
+
+    return watts_val, gpu_val, boost_val
+
+
+def _read_sysfs_int(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        return int(raw) if raw.isdigit() else None
+    except OSError:
+        return None
+
+
+def _write_cpufreq_controls(
+    cpu_root: Path,
+    root_real: str,
+    boost_enabled: bool,
+    target_governor: str,
+) -> None:
+    real_cpu = _resolve_under_root(cpu_root, root_real)
+    if real_cpu is None:
+        return
+    boost_file = _resolve_under_root(real_cpu / "cpufreq" / "boost", root_real)
+    if boost_file is not None and boost_file.exists():
+        safe_write_sysfs(boost_file, "1\n" if boost_enabled else "0\n")
+    try:
+        gov_nodes = sorted(real_cpu.glob("cpu[0-9]*/cpufreq/scaling_governor"))
+    except OSError:
+        return
+    for gov_node in gov_nodes:
+        real_gov = _resolve_under_root(gov_node, root_real)
+        if real_gov is None or not real_gov.exists():
+            continue
+        avail_path = real_gov.parent / "scaling_available_governors"
+        chosen = target_governor
+        if avail_path.exists():
+            try:
+                avail = avail_path.read_text(encoding="utf-8", errors="replace").split()
+            except OSError:
+                avail = []
+            if avail and chosen not in avail:
+                if "schedutil" in avail:
+                    chosen = "schedutil"
+                elif "powersave" in avail:
+                    chosen = "powersave"
+                else:
+                    continue
+        safe_write_sysfs(real_gov, f"{chosen}\n")
+
+
+def apply_runtime_overclock_sysfs(
+    watts: int,
+    gpu_max_mhz: int = 0,
+    cpu_boost: bool = True,
+    *,
+    drm_root: Path = Path("/sys/class/drm"),
+    cpu_root: Path = Path("/sys/devices/system/cpu"),
+    sys_devices_root: str = "/sys/devices/",
+) -> bool:
+    """Apply volatile Linux sysfs PPT caps, optional GPU OD range, and cpufreq state."""
+    watts_val, gpu_mhz, boost_flag = validate_overclock_args(watts, gpu_max_mhz, cpu_boost)
+    root_real = _normalized_sys_root(sys_devices_root)
+    if root_real is None:
+        return False
+
+    dev_dir = find_validated_amdgpu_device(drm_root=drm_root, sys_devices_root=sys_devices_root)
+    if dev_dir is None:
+        return False
+    hwmon_dir = find_validated_amdgpu_hwmon(dev_dir, sys_devices_root=sys_devices_root)
+    if hwmon_dir is None:
+        return False
+
+    p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 22_000_000
+    target_p1_uw = min(watts_val * 1_000_000, p1_max_uw)
+    p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+    if p1_path is None or not p1_path.exists() or not safe_write_sysfs(p1_path, f"{target_p1_uw}\n"):
+        return False
+
+    p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+    if p2_path is not None and p2_path.exists():
+        p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 24_000_000
+        target_p2_uw = min((watts_val + 2) * 1_000_000, p2_max_uw, 24_000_000)
+        safe_write_sysfs(p2_path, f"{target_p2_uw}\n")
+
+    dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
+    pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
+    if gpu_mhz >= 1600:
+        if dpm_level is not None and dpm_level.exists() and pp_od is not None and pp_od.exists():
+            if safe_write_sysfs(dpm_level, "manual\n"):
+                safe_write_sysfs(pp_od, "s 0 400\n")
+                safe_write_sysfs(pp_od, f"s 1 {gpu_mhz}\n")
+                safe_write_sysfs(pp_od, "c\n")
+    elif gpu_mhz == 0 and dpm_level is not None and dpm_level.exists():
+        safe_write_sysfs(dpm_level, "auto\n")
+
+    _write_cpufreq_controls(
+        cpu_root=cpu_root,
+        root_real=root_real,
+        boost_enabled=boost_flag,
+        target_governor="performance" if boost_flag else "schedutil",
+    )
+    return True
+
+
+def reset_runtime_overclock_sysfs(
+    watts: int = 15,
+    *,
+    drm_root: Path = Path("/sys/class/drm"),
+    cpu_root: Path = Path("/sys/devices/system/cpu"),
+    sys_devices_root: str = "/sys/devices/",
+) -> bool:
+    """Restore stock PPT cap (clamped <= 15W), GPU DPM auto, CPU boost enabled, and schedutil."""
+    if isinstance(watts, (bool, float)):
+        safe_watts = 15
+    else:
+        try:
+            safe_watts = max(3, min(15, int(watts)))
+        except (TypeError, ValueError):
+            safe_watts = 15
+
+    root_real = _normalized_sys_root(sys_devices_root)
+    if root_real is None:
+        return False
+
+    dev_dir = find_validated_amdgpu_device(drm_root=drm_root, sys_devices_root=sys_devices_root)
+    if dev_dir is None:
+        return False
+    hwmon_dir = find_validated_amdgpu_hwmon(dev_dir, sys_devices_root=sys_devices_root)
+    if hwmon_dir is None:
+        return False
+
+    p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 15_000_000
+    target_p1_uw = min(safe_watts * 1_000_000, p1_max_uw)
+    p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+    ok = p1_path is not None and p1_path.exists() and safe_write_sysfs(p1_path, f"{target_p1_uw}\n")
+
+    p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+    if p2_path is not None and p2_path.exists():
+        p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 15_000_000
+        target_p2_uw = min(safe_watts * 1_000_000, p2_max_uw)
+        safe_write_sysfs(p2_path, f"{target_p2_uw}\n")
+
+    pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
+    if pp_od is not None and pp_od.exists():
+        safe_write_sysfs(pp_od, "r\n")
+        safe_write_sysfs(pp_od, "c\n")
+
+    dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
+    if dpm_level is not None and dpm_level.exists():
+        safe_write_sysfs(dpm_level, "auto\n")
+
+    _write_cpufreq_controls(
+        cpu_root=cpu_root,
+        root_real=root_real,
+        boost_enabled=True,
+        target_governor="schedutil",
+    )
+    return ok

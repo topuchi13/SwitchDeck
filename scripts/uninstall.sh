@@ -42,6 +42,7 @@ SUDO_PREFIX=""
 if [ "$(id -u)" -ne 0 ]; then
     SUDO_PREFIX="sudo"
 fi
+[ -x /usr/local/bin/switchdeck-helper ] && $SUDO_PREFIX /usr/local/bin/switchdeck-helper reset-overclock 15 2>/dev/null || true
 $SUDO_PREFIX rm -f /usr/local/bin/switchdeck-helper /etc/sudoers.d/switchdeck /etc/atomic-update.conf.d/switchdeck.conf || true
 
 echo "[SwitchDeck] Uninstalled cleanly."

@@ -240,6 +240,30 @@ export const qamStyles = {
     color: COLORS.textSecondary,
     wordBreak: "break-all",
   } satisfies CSSProperties,
+
+  overclockWarningCard: {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "linear-gradient(145deg, rgba(251, 191, 36, 0.14), rgba(255, 69, 84, 0.10))",
+    border: `1px solid ${COLORS.amberBorder}`,
+    borderRadius: "9px",
+    padding: "9px 10px",
+    marginBottom: "4px",
+    color: COLORS.textPrimary,
+  } satisfies CSSProperties,
+
+  telemetryCard: {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "rgba(255, 255, 255, 0.03)",
+    border: `1px solid ${COLORS.borderSubtle}`,
+    borderRadius: "8px",
+    padding: "7px 9px",
+    marginBottom: "2px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+  } satisfies CSSProperties,
 };
 
 export const toastStyles = {
@@ -304,10 +328,11 @@ export const toastStyles = {
     alignItems: "center",
   } satisfies CSSProperties,
 
-  chip: (tone: "blue" | "coral" | "slate"): CSSProperties => {
+  chip: (tone: "blue" | "coral" | "slate" | "amber"): CSSProperties => {
     const map = {
       blue: { bg: COLORS.neonBlueSoft, fg: COLORS.neonBlue, border: COLORS.neonBlueBorder },
       coral: { bg: COLORS.neonCoralSoft, fg: COLORS.neonCoral, border: COLORS.neonCoralBorder },
+      amber: { bg: COLORS.amberSoft, fg: COLORS.amber, border: COLORS.amberBorder },
       slate: {
         bg: "rgba(255, 255, 255, 0.06)",
         fg: "#e2e8f0",

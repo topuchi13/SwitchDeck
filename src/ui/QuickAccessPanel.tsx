@@ -42,13 +42,45 @@ export interface QuickAccessPanelProps {
   transport: SwitchDeckTransport;
   initialStatus?: DaemonStatus;
   initialProfile?: DockProfile;
-  initialScrollSection?: "top" | "scaling" | "tv";
+  initialScrollSection?: "top" | "scaling" | "tv" | "overclock";
 }
 
 interface FeedbackMessage {
   tone: "blue" | "coral" | "emerald";
   text: string;
 }
+
+interface OverclockPresetDef {
+  key: "lcd_conservative" | "oled_balanced" | "gpu_aaa";
+  label: string;
+  boost_tdp_watts: number;
+  gpu_max_mhz: number;
+  cpu_boost: boolean;
+}
+
+const OVERCLOCK_PRESETS: OverclockPresetDef[] = [
+  {
+    key: "lcd_conservative",
+    label: "LCD 18W · 1700MHz",
+    boost_tdp_watts: 18,
+    gpu_max_mhz: 1700,
+    cpu_boost: true,
+  },
+  {
+    key: "oled_balanced",
+    label: "OLED 20W · 1800MHz",
+    boost_tdp_watts: 20,
+    gpu_max_mhz: 1800,
+    cpu_boost: true,
+  },
+  {
+    key: "gpu_aaa",
+    label: "AAA 19W · No Boost",
+    boost_tdp_watts: 19,
+    gpu_max_mhz: 1800,
+    cpu_boost: false,
+  },
+];
 
 const CONTAINER_PRESETS: Array<{ key: string; width: number; height: number; label: string }> = [
   { key: "1920x1080", width: 1920, height: 1080, label: "1920x1080 (1080p Full HD)" },
@@ -119,9 +151,16 @@ const HeroStatusCard: FC<{
   const displayName = status.is_docked
     ? profile?.display_name || status.active_connector || "External Display"
     : "Built-in Display";
-  const powerLabel = `${status.tdp_watts ?? "--"}W TDP · ${
+  const powerLabel = `${status.tdp_watts ?? "--"}W ${status.overclock_active ? "OC" : "TDP"} · ${
     status.charge_limit > 0 ? `${status.charge_limit}% Cap` : "100% Cap"
   }`;
+  const powerSubParts: string[] = [];
+  if (status.apu_temp_c != null) {
+    powerSubParts.push(`${status.apu_temp_c.toFixed(1)}°C APU`);
+  }
+  if (status.deck_model === "Jupiter") {
+    powerSubParts.push(`BT Wake: ${status.lcd_bluetooth_wakeup_enabled ? "Armed" : "Off"}`);
+  }
 
   return (
     <div style={qamStyles.heroCard}>
@@ -132,6 +171,7 @@ const HeroStatusCard: FC<{
         </div>
         <div style={qamStyles.pillRow}>
           <span style={qamStyles.pill("slate")}>{formatDeckModelLabel(status.deck_model)}</span>
+          {status.overclock_active && <span style={qamStyles.pill("amber")}>OC</span>}
           <span style={qamStyles.pill(status.is_docked ? "blue" : "coral")}>
             {status.is_docked ? "Docked" : "Handheld"}
           </span>
@@ -211,15 +251,22 @@ const HeroStatusCard: FC<{
 
         <div style={qamStyles.statRow}>
           <span style={qamStyles.statLabel}>
-            <FaBolt size={11} color={status.travel_charge_override ? COLORS.amber : COLORS.emerald} />
+            <FaBolt
+              size={11}
+              color={
+                status.overclock_thermal_throttled
+                  ? COLORS.neonCoral
+                  : status.overclock_active || status.travel_charge_override
+                    ? COLORS.amber
+                    : COLORS.emerald
+              }
+            />
             <span>Power</span>
           </span>
           <div style={qamStyles.statValueWrap}>
             <span style={qamStyles.statValue}>{powerLabel}</span>
-            {status.deck_model === "Jupiter" && (
-              <span style={qamStyles.statSub}>
-                LCD BT Wake: {status.lcd_bluetooth_wakeup_enabled ? "Dock Armed" : "Locked Off"}
-              </span>
+            {powerSubParts.length > 0 && (
+              <span style={qamStyles.statSub}>{powerSubParts.join(" · ")}</span>
             )}
           </div>
         </div>
@@ -229,7 +276,11 @@ const HeroStatusCard: FC<{
 };
 
 const DiagnosticWarningBanner: FC<{ status: DaemonStatus }> = ({ status }) => {
-  if (status.unhandled_dongles.length === 0 && !status.last_error) {
+  if (
+    status.unhandled_dongles.length === 0 &&
+    !status.last_error &&
+    !status.overclock_thermal_throttled
+  ) {
     return null;
   }
 
@@ -240,6 +291,17 @@ const DiagnosticWarningBanner: FC<{ status: DaemonStatus }> = ({ status }) => {
         <span>Hardware / Driver Alert</span>
       </div>
       <div style={qamStyles.warningBody}>
+        {status.overclock_thermal_throttled && (
+          <div style={{ marginBottom: "5px" }}>
+            <div style={{ fontWeight: 700, color: COLORS.amber }}>
+              Thermal Watchdog Active (&lt;= 15W)
+            </div>
+            <div style={{ color: "#cbd5e1" }}>
+              APU reached &gt;= 90°C. Docked Overclock automatically stepped down to safe stock
+              power until cooling below 80°C.
+            </div>
+          </div>
+        )}
         {status.unhandled_dongles.map((dongle) => (
           <div key={`${dongle.usb_id}-${dongle.sysfs_path}`} style={{ marginBottom: "5px" }}>
             <div style={{ fontWeight: 700, color: COLORS.textPrimary }}>
@@ -281,10 +343,18 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   const [tvWebhookDraft, setTvWebhookDraft] = useState<string>(
     initialProfile?.tv.webhook_url ?? "",
   );
+  const [boostTdpDraft, setBoostTdpDraft] = useState<number>(
+    initialProfile?.overclock?.boost_tdp_watts ?? 18,
+  );
+  const [gpuMaxDraft, setGpuMaxDraft] = useState<number>(() => {
+    const mhz = initialProfile?.overclock?.gpu_max_mhz ?? 0;
+    return mhz >= 1600 ? mhz : 1600;
+  });
 
   const sliderDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scalingSectionRef = useRef<HTMLDivElement | null>(null);
   const tvSectionRef = useRef<HTMLDivElement | null>(null);
+  const overclockSectionRef = useRef<HTMLDivElement | null>(null);
 
   const syncProfileDrafts = useCallback((nextProf: DockProfile) => {
     setProfile(nextProf);
@@ -294,6 +364,9 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setTvHostDraft(nextProf.tv?.host ?? "");
     setTvMacDraft(nextProf.tv?.mac_address ?? "");
     setTvWebhookDraft(nextProf.tv?.webhook_url ?? "");
+    setBoostTdpDraft(nextProf.overclock?.boost_tdp_watts ?? 18);
+    const nextGpu = nextProf.overclock?.gpu_max_mhz ?? 0;
+    setGpuMaxDraft(nextGpu >= 1600 ? nextGpu : 1600);
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -332,6 +405,8 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       scalingSectionRef.current.scrollIntoView({ block: "start" });
     } else if (initialScrollSection === "tv" && tvSectionRef.current) {
       tvSectionRef.current.scrollIntoView({ block: "start" });
+    } else if (initialScrollSection === "overclock" && overclockSectionRef.current) {
+      overclockSectionRef.current.scrollIntoView({ block: "start" });
     }
   }, [initialScrollSection]);
 
@@ -575,6 +650,64 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
   const activeDriver: TvDriverKind = profile?.tv?.driver ?? "cec";
   const hasCertPin = Boolean(profile?.tv_cert_fingerprint);
+  const oc = profile?.overclock ?? {
+    risk_acknowledged: false,
+    enabled: false,
+    boost_tdp_watts: 18,
+    gpu_max_mhz: 0,
+    cpu_boost: true,
+  };
+  const ocCurrentGpu = oc.gpu_max_mhz >= 1600 ? oc.gpu_max_mhz : 0;
+  const matchedOcPreset = OVERCLOCK_PRESETS.find(
+    (p) =>
+      p.boost_tdp_watts === oc.boost_tdp_watts &&
+      p.gpu_max_mhz === ocCurrentGpu &&
+      p.cpu_boost === oc.cpu_boost,
+  );
+  const ocPresetOptions: DropdownOption[] = OVERCLOCK_PRESETS.map((p) => ({
+    data: p.key,
+    label: p.label,
+  }));
+  if (!matchedOcPreset) {
+    ocPresetOptions.unshift({
+      data: "custom",
+      label: `Custom (${oc.boost_tdp_watts}W · ${ocCurrentGpu >= 1600 ? `${ocCurrentGpu}MHz` : "Auto"})`,
+    });
+  }
+  const selectedOcPresetKey = matchedOcPreset ? matchedOcPreset.key : "custom";
+
+  const handleOcPresetChange = (opt: DropdownOption) => {
+    const preset = OVERCLOCK_PRESETS.find((p) => p.key === String(opt.data));
+    if (!preset) return;
+    setBoostTdpDraft(preset.boost_tdp_watts);
+    setGpuMaxDraft(preset.gpu_max_mhz >= 1600 ? preset.gpu_max_mhz : 1600);
+    void commitProfilePatch(
+      {
+        overclock: {
+          boost_tdp_watts: preset.boost_tdp_watts,
+          gpu_max_mhz: preset.gpu_max_mhz,
+          cpu_boost: preset.cpu_boost,
+        },
+      },
+      `Applied preset: ${preset.label}`,
+    );
+  };
+
+  let ocPillTone: "amber" | "coral" | "slate" = "slate";
+  let ocPillLabel = "Stock <= 15W";
+  if (status?.overclock_thermal_throttled) {
+    ocPillTone = "coral";
+    ocPillLabel = "Thermal Step-Down <= 15W";
+  } else if (status?.overclock_active) {
+    ocPillTone = "amber";
+    ocPillLabel = "OC Active";
+  } else if (oc.enabled && !status?.is_docked) {
+    ocPillTone = "slate";
+    ocPillLabel = "Standby (Handheld)";
+  } else if (oc.enabled && !status?.ac_online) {
+    ocPillTone = "coral";
+    ocPillLabel = "Blocked (No AC)";
+  }
 
   return (
     <div style={qamStyles.root}>
@@ -698,9 +831,9 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
               <PanelSectionRow>
                 <SliderField
                   label="Docked TDP"
-                  value={dockedTdpDraft}
+                  value={Math.min(15, dockedTdpDraft)}
                   min={3}
-                  max={30}
+                  max={15}
                   step={1}
                   valueSuffix="W"
                   showValue
@@ -877,6 +1010,211 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     Test TV Wake
                   </ButtonItem>
                 </PanelSectionRow>
+              )}
+            </PanelSection>
+          </div>
+
+          <div ref={overclockSectionRef}>
+            <PanelSection title="Experimental: Docked Overclock">
+              {!oc.risk_acknowledged ? (
+                <>
+                  <PanelSectionRow>
+                    <div style={qamStyles.overclockWarningCard}>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          color: COLORS.amber,
+                          fontSize: "11.5px",
+                          fontWeight: 700,
+                          marginBottom: "4px",
+                        }}
+                      >
+                        <FaExclamationTriangle size={12} />
+                        <span>Experimental Power &amp; Clock Warning</span>
+                      </div>
+                      <div style={qamStyles.warningBody}>
+                        <div style={{ marginBottom: "3px" }}>
+                          <strong>Volatile sysfs only:</strong> zero BIOS/NVRAM edits, zero
+                          undervolting or memory timing writes (avoids idle C-state crashes).
+                        </div>
+                        <div style={{ marginBottom: "3px" }}>
+                          <strong>Thermals &amp; PD supply:</strong> raises sustained heat and fan
+                          noise. Use a 45W-65W+ PD charger when boosting through a USB-C hub.
+                        </div>
+                        <div>
+                          <strong>Guardrails:</strong> hard-capped at 22W / 2000 MHz (community safe:
+                          18-19W LCD, 19-22W OLED), requires AC power, steps down at &gt;= 90°C, and
+                          resets to stock on undock. You assume thermal &amp; hardware risk.
+                        </div>
+                      </div>
+                    </div>
+                  </PanelSectionRow>
+                  <PanelSectionRow>
+                    <ButtonItem
+                      layout="below"
+                      disabled={busy}
+                      onClick={() =>
+                        void commitProfilePatch(
+                          { overclock: { risk_acknowledged: true } },
+                          "Experimental docked overclock unlocked (disabled until toggled on)",
+                        )
+                      }
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                        <FaBolt size={11} color={COLORS.amber} />
+                        <span>I Understand — Unlock Experimental Controls</span>
+                      </span>
+                    </ButtonItem>
+                  </PanelSectionRow>
+                </>
+              ) : (
+                <>
+                  <PanelSectionRow>
+                    <div style={qamStyles.telemetryCard}>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span style={qamStyles.pill(ocPillTone)}>
+                          <FaBolt size={9} />
+                          <span>{ocPillLabel}</span>
+                        </span>
+                        <span style={qamStyles.statSub}>
+                          APU{" "}
+                          {status?.apu_temp_c != null ? `${status.apu_temp_c.toFixed(0)}°C` : "--"}{" "}
+                          · SMU {status?.hw_max_tdp_watts ?? 22}W
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "10.5px", color: COLORS.textPrimary, fontWeight: 600 }}>
+                        {status?.overclock_status_note ||
+                          `Target ${boostTdpDraft}W · ${gpuMaxDraft <= 1600 ? "GPU Stock Auto" : `GPU 400-${gpuMaxDraft} MHz`} · CPU Boost ${oc.cpu_boost ? "On" : "Off"}`}
+                      </div>
+                      <div style={{ fontSize: "10px", color: COLORS.textSecondary, lineHeight: 1.35 }}>
+                        45W-65W+ PD charger recommended on hubs · Auto-steps &lt;= 15W at &gt;=
+                        90°C
+                      </div>
+                    </div>
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <DropdownItem
+                      label="Preset"
+                      rgOptions={ocPresetOptions}
+                      selectedOption={selectedOcPresetKey}
+                      disabled={busy}
+                      onChange={handleOcPresetChange}
+                    />
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <ToggleField
+                      label="Enable Docked Overclock"
+                      description="Applies only when docked on AC; auto-resets on undock or >= 90°C limit"
+                      checked={oc.enabled}
+                      disabled={busy}
+                      onChange={(val) =>
+                        void commitProfilePatch(
+                          { overclock: { enabled: val } },
+                          val
+                            ? status?.is_docked
+                              ? status.ac_online
+                                ? "Experimental docked overclock active"
+                                : "Overclock armed (waiting for AC power)"
+                              : "Overclock armed (applies when docked on AC)"
+                            : "Overclock disabled — restored stock <= 15W",
+                        )
+                      }
+                    />
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <SliderField
+                      label="Boost Sustained TDP"
+                      value={boostTdpDraft}
+                      min={15}
+                      max={22}
+                      step={1}
+                      valueSuffix="W"
+                      showValue
+                      disabled={busy}
+                      onChange={(val) => {
+                        setBoostTdpDraft(val);
+                        scheduleSliderPatch({ overclock: { boost_tdp_watts: val } });
+                      }}
+                    />
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <SliderField
+                      label={gpuMaxDraft <= 1600 ? "Max GPU Clock (Stock Auto)" : "Max GPU Clock (400+)"}
+                      value={gpuMaxDraft}
+                      min={1600}
+                      max={2000}
+                      step={50}
+                      valueSuffix=" MHz"
+                      showValue
+                      disabled={busy}
+                      onChange={(val) => {
+                        setGpuMaxDraft(val);
+                        scheduleSliderPatch({
+                          overclock: { gpu_max_mhz: val <= 1600 ? 0 : val },
+                        });
+                      }}
+                    />
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <ToggleField
+                      label="Docked CPU Turbo Boost"
+                      description="Turn off in GPU-bound AAA titles to leave more SMU power headroom for GPU"
+                      checked={oc.cpu_boost}
+                      disabled={busy}
+                      onChange={(val) =>
+                        void commitProfilePatch(
+                          { overclock: { cpu_boost: val } },
+                          val
+                            ? "Docked CPU turbo boost enabled"
+                            : "Docked CPU turbo boost disabled for GPU power headroom",
+                        )
+                      }
+                    />
+                  </PanelSectionRow>
+
+                  <PanelSectionRow>
+                    <ButtonItem
+                      layout="below"
+                      disabled={busy}
+                      onClick={() => {
+                        setBoostTdpDraft(15);
+                        setGpuMaxDraft(1600);
+                        void commitProfilePatch(
+                          {
+                            overclock: {
+                              risk_acknowledged: false,
+                              enabled: false,
+                              boost_tdp_watts: 15,
+                              gpu_max_mhz: 0,
+                              cpu_boost: true,
+                            },
+                          },
+                          "Overclock reset to stock 15W and controls locked",
+                        );
+                      }}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                        <FaLock size={11} color={COLORS.neonCoral} />
+                        <span>Reset &amp; Lock Overclock Controls</span>
+                      </span>
+                    </ButtonItem>
+                  </PanelSectionRow>
+                </>
               )}
             </PanelSection>
           </div>

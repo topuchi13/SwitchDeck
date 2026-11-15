@@ -34,11 +34,12 @@ export interface SwitchToastCardProps {
 
 export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact = false }) => {
   const isDocked = transition.kind === "docked";
+  const isOc = Boolean(transition.overclock_active);
   const powerLabel =
     transition.tdp_watts != null
-      ? `${transition.tdp_watts}W · ${
+      ? `${transition.tdp_watts}W ${isOc ? "OC" : ""}· ${
           transition.charge_limit > 0 ? `${transition.charge_limit}% Cap` : "100% Cap"
-        }`
+        }`.replace("  ", " ")
       : transition.charge_limit > 0
         ? `${transition.charge_limit}% Cap`
         : "Uncapped";
@@ -54,6 +55,7 @@ export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact 
           </span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+          {isOc && <span style={qamStyles.pill("amber")}>OC</span>}
           {transition.vrr_enabled && <span style={qamStyles.pill("blue")}>VRR</span>}
           <span style={qamStyles.pill(isDocked ? "blue" : "coral")}>
             {isDocked ? "Docked" : "Handheld"}
@@ -78,7 +80,7 @@ export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact 
             <span>{transition.scaling_summary}</span>
           </span>
         )}
-        <span style={toastStyles.chip(isDocked ? "blue" : "coral")}>
+        <span style={toastStyles.chip(isOc ? "amber" : isDocked ? "blue" : "coral")}>
           <FaBolt size={10} />
           <span>{powerLabel}</span>
         </span>

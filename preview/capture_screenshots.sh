@@ -46,5 +46,6 @@ capture "handheld" 1280 800
 capture "docked_s90c" 1920 1080
 capture "docked_warning" 1920 1080
 capture "tv_pairing" 1280 800
+capture "docked_overclock" 1920 1080
 
 ls -lh "$SHOT_DIR"

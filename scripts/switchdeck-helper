@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Minimal validated root sysfs helper for SwitchDeck.
 
-Permits ONLY two safe operations without running the full daemon as root:
+Permits ONLY strictly validated runtime operations without running the full daemon as root:
 1. bind-neptune / unbind-neptune for verified Valve 28de:1205 usbhid interfaces.
 2. set-wakeup (enabled|disabled) on validated /sys/devices/.../power/wakeup nodes.
+3. apply-overclock / reset-overclock on validated amdgpu hwmon/OD/cpufreq nodes (volatile only).
 """
 
 from __future__ import annotations
@@ -12,11 +13,40 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 IFACE_RE = re.compile(r"^[0-9]+-[0-9]+(?:\.[0-9]+)*:1\.[0-9]+\Z")
 USB_DEVICES_DIR = Path("/sys/bus/usb/devices")
 USB_HID_DIR = Path("/sys/bus/usb/drivers/usbhid")
+DRM_CLASS_DIR = Path("/sys/class/drm")
+CPU_DEVICES_DIR = Path("/sys/devices/system/cpu")
 SYS_DEVICES_ROOT = "/sys/devices/"
+
+
+def _normalized_root(sys_devices_root: str = SYS_DEVICES_ROOT) -> str | None:
+    if not sys_devices_root or "\x00" in sys_devices_root:
+        return None
+    try:
+        root_real = os.path.realpath(sys_devices_root)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not root_real.endswith("/"):
+        root_real += "/"
+    if root_real == "/":
+        return None
+    return root_real
+
+
+def _resolve_under_root(target: str | Path, root_real: str) -> Path | None:
+    if not target or "\x00" in str(target):
+        return None
+    try:
+        real = os.path.realpath(str(target))
+    except (OSError, ValueError, TypeError):
+        return None
+    if real != root_real.rstrip("/") and not real.startswith(root_real):
+        return None
+    return Path(real)
 
 
 def validate_neptune_iface(iface: str, usb_devices_root: Path = USB_DEVICES_DIR) -> bool:
@@ -33,20 +63,35 @@ def validate_neptune_iface(iface: str, usb_devices_root: Path = USB_DEVICES_DIR)
 
 
 def validate_wakeup_path(target: str, sys_devices_root: str = SYS_DEVICES_ROOT) -> Path | None:
-    if not target or "\x00" in target:
+    root_real = _normalized_root(sys_devices_root)
+    if root_real is None:
         return None
-    try:
-        real = os.path.realpath(target)
-        root_real = os.path.realpath(sys_devices_root)
-    except (OSError, ValueError, TypeError):
+    resolved = _resolve_under_root(target, root_real)
+    if resolved is None or not os.fspath(resolved).endswith("/power/wakeup"):
         return None
-    if not root_real.endswith("/"):
-        root_real += "/"
-    if root_real == "/":
-        return None
-    if not real.startswith(root_real) or not real.endswith("/power/wakeup"):
-        return None
-    return Path(real)
+    return resolved
+
+
+def validate_overclock_args(watts: Any, gpu_max_mhz: Any, cpu_boost: Any) -> tuple[int, int, bool]:
+    if isinstance(watts, (bool, float)):
+        raise ValueError("watts must be an integer")
+    watts_val = int(watts)
+    if watts_val < 3 or watts_val > 22:
+        raise ValueError(f"watts out of safe bounds (3..22): {watts_val}")
+
+    if isinstance(gpu_max_mhz, (bool, float)):
+        raise ValueError("gpu_max_mhz must be an integer")
+    gpu_val = int(gpu_max_mhz)
+    if gpu_val != 0 and (gpu_val < 1600 or gpu_val > 2000):
+        raise ValueError(f"gpu_max_mhz must be 0 or 1600..2000: {gpu_val}")
+
+    if isinstance(cpu_boost, bool):
+        boost_val = cpu_boost
+    elif isinstance(cpu_boost, str) and cpu_boost in ("0", "1"):
+        boost_val = cpu_boost == "1"
+    else:
+        raise ValueError(f"cpu_boost must be 0 or 1: {cpu_boost!r}")
+    return watts_val, gpu_val, boost_val
 
 
 def safe_write_sysfs(path: Path, value: str) -> None:
@@ -65,9 +110,75 @@ def safe_write_sysfs(path: Path, value: str) -> None:
         os.close(fd)
 
 
+def _find_amdgpu_dev_and_hwmon(
+    drm_root: Path = DRM_CLASS_DIR,
+    sys_devices_root: str = SYS_DEVICES_ROOT,
+) -> tuple[Path, Path, str] | None:
+    root_real = _normalized_root(sys_devices_root)
+    if root_real is None:
+        return None
+    for candidate in sorted(drm_root.glob("card*/device")):
+        real_dev = _resolve_under_root(candidate, root_real)
+        if real_dev is None:
+            continue
+        try:
+            vendor = (real_dev / "vendor").read_text(encoding="utf-8", errors="replace").strip().lower()
+        except OSError:
+            continue
+        if vendor != "0x1002":
+            continue
+        dev_prefix = os.fspath(real_dev).rstrip("/") + "/"
+        for hw_cand in sorted((real_dev / "hwmon").glob("hwmon*")):
+            real_hw = _resolve_under_root(hw_cand, dev_prefix)
+            if real_hw is None or not os.fspath(real_hw).startswith(root_real):
+                continue
+            name_file = real_hw / "name"
+            if name_file.exists():
+                try:
+                    if name_file.read_text(encoding="utf-8", errors="replace").strip().lower() != "amdgpu":
+                        continue
+                except OSError:
+                    continue
+            return real_dev, real_hw, root_real
+    return None
+
+
+def _read_sysfs_int(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        return int(raw) if raw.isdigit() else None
+    except OSError:
+        return None
+
+
+def _write_cpufreq(boost_enabled: bool, governor: str, root_real: str, cpu_root: Path = CPU_DEVICES_DIR) -> None:
+    real_cpu = _resolve_under_root(cpu_root, root_real)
+    if real_cpu is None:
+        return
+    boost_file = _resolve_under_root(real_cpu / "cpufreq" / "boost", root_real)
+    if boost_file is not None and boost_file.exists():
+        safe_write_sysfs(boost_file, "1\n" if boost_enabled else "0\n")
+    for gov_node in sorted(real_cpu.glob("cpu[0-9]*/cpufreq/scaling_governor")):
+        real_gov = _resolve_under_root(gov_node, root_real)
+        if real_gov is None or not real_gov.exists():
+            continue
+        avail_file = real_gov.parent / "scaling_available_governors"
+        chosen = governor
+        if avail_file.exists():
+            avail = avail_file.read_text(encoding="utf-8", errors="replace").split()
+            if avail and chosen not in avail:
+                chosen = "schedutil" if "schedutil" in avail else ("powersave" if "powersave" in avail else "")
+                if not chosen:
+                    continue
+        safe_write_sysfs(real_gov, f"{chosen}\n")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
-        print("Usage: switchdeck-helper <bind-neptune|unbind-neptune|set-wakeup> <target> [value]", file=sys.stderr)
+        print(
+            "Usage: switchdeck-helper <bind-neptune|unbind-neptune|set-wakeup|apply-overclock|reset-overclock> ...",
+            file=sys.stderr,
+        )
         return 2
 
     action, target = argv[1], argv[2]
@@ -99,6 +210,87 @@ def main(argv: list[str]) -> int:
             return 0
         except OSError as exc:
             print(f"wakeup write failed: {exc}", file=sys.stderr)
+            return 1
+
+    if action == "apply-overclock":
+        if len(argv) != 5:
+            print("Usage: switchdeck-helper apply-overclock <watts> <gpu_max_mhz> <0|1>", file=sys.stderr)
+            return 2
+        try:
+            watts_val, gpu_mhz, boost_flag = validate_overclock_args(argv[2], argv[3], argv[4])
+        except ValueError as exc:
+            print(f"Rejected overclock arguments: {exc}", file=sys.stderr)
+            return 1
+        located = _find_amdgpu_dev_and_hwmon()
+        if located is None:
+            print("No validated amdgpu device found", file=sys.stderr)
+            return 1
+        dev_dir, hwmon_dir, root_real = located
+        try:
+            p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 22_000_000
+            p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+            if p1_path is None or not p1_path.exists():
+                return 1
+            safe_write_sysfs(p1_path, f"{min(watts_val * 1_000_000, p1_max_uw)}\n")
+            p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+            if p2_path is not None and p2_path.exists():
+                p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 24_000_000
+                safe_write_sysfs(p2_path, f"{min((watts_val + 2) * 1_000_000, p2_max_uw, 24_000_000)}\n")
+
+            dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
+            pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
+            if gpu_mhz >= 1600 and dpm_level and dpm_level.exists() and pp_od and pp_od.exists():
+                safe_write_sysfs(dpm_level, "manual\n")
+                safe_write_sysfs(pp_od, "s 0 400\n")
+                safe_write_sysfs(pp_od, f"s 1 {gpu_mhz}\n")
+                safe_write_sysfs(pp_od, "c\n")
+            elif gpu_mhz == 0 and dpm_level and dpm_level.exists():
+                safe_write_sysfs(dpm_level, "auto\n")
+
+            _write_cpufreq(boost_flag, "performance" if boost_flag else "schedutil", root_real)
+            return 0
+        except OSError as exc:
+            print(f"overclock sysfs write failed: {exc}", file=sys.stderr)
+            return 1
+
+    if action == "reset-overclock":
+        if len(argv) != 3:
+            print("Usage: switchdeck-helper reset-overclock <watts>", file=sys.stderr)
+            return 2
+        try:
+            watts_val = int(argv[2])
+            if watts_val < 3 or watts_val > 15:
+                raise ValueError(f"reset watts must be 3..15: {watts_val}")
+        except ValueError as exc:
+            print(f"Rejected reset watts: {exc}", file=sys.stderr)
+            return 1
+        located = _find_amdgpu_dev_and_hwmon()
+        if located is None:
+            print("No validated amdgpu device found", file=sys.stderr)
+            return 1
+        dev_dir, hwmon_dir, root_real = located
+        try:
+            p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 15_000_000
+            p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+            if p1_path is None or not p1_path.exists():
+                return 1
+            safe_write_sysfs(p1_path, f"{min(watts_val * 1_000_000, p1_max_uw)}\n")
+            p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+            if p2_path is not None and p2_path.exists():
+                p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 15_000_000
+                safe_write_sysfs(p2_path, f"{min(watts_val * 1_000_000, p2_max_uw)}\n")
+
+            pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
+            if pp_od is not None and pp_od.exists():
+                safe_write_sysfs(pp_od, "r\n")
+                safe_write_sysfs(pp_od, "c\n")
+            dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
+            if dpm_level is not None and dpm_level.exists():
+                safe_write_sysfs(dpm_level, "auto\n")
+            _write_cpufreq(True, "schedutil", root_real)
+            return 0
+        except OSError as exc:
+            print(f"reset-overclock failed: {exc}", file=sys.stderr)
             return 1
 
     print(f"Unknown action: {action}", file=sys.stderr)

@@ -9,7 +9,18 @@ from dataclasses import replace
 from typing import Any
 
 from .backends.protocol import HardwareBackend
-from .domain import DaemonStatus, DeckModel, DisplayConnector, DisplayMode, ScalingDecision, DockProfile
+from .domain import (
+    DaemonStatus,
+    DeckModel,
+    DisplayConnector,
+    DisplayMode,
+    DockProfile,
+    HARD_MAX_OVERCLOCK_TDP_WATTS,
+    STOCK_MAX_TDP_WATTS,
+    ScalingDecision,
+    THERMAL_THROTTLE_RECOVER_C,
+    THERMAL_THROTTLE_TRIGGER_C,
+)
 from .edid import select_best_output_mode
 from .profiles import ProfileStore
 from .scaling import compute_universal_scaling
@@ -48,6 +59,10 @@ class SwitchDeckCoordinator:
         self._transition_seq: int = 0
         self._last_transition: dict[str, Any] | None = None
         self._last_error: str | None = None
+        self._prev_ac_online: bool | None = None
+        self._overclock_active: bool = False
+        self._thermal_throttled: bool = False
+        self._last_overclock_spec: tuple[int, int, bool] | None = None
 
     def _pick_primary_connector(self, displays: list[DisplayConnector]) -> DisplayConnector | None:
         connected = [d for d in displays if d.connected]
@@ -130,11 +145,13 @@ class SwitchDeckCoordinator:
         edid_id: str | None,
         display_name: str,
         is_transition: bool,
+        *,
+        apply_stock_tdp: bool = True,
     ) -> None:
         if docked_now:
             prof = self.store.get_profile(edid_id, display_name)
             if is_transition:
-                if ac_online:
+                if ac_online and apply_stock_tdp:
                     self.backend.set_tdp_limit(prof.docked_tdp_watts)
                     self.backend.set_gpu_performance_auto()
                 target_cap = -1 if self.travel_charge_override else prof.docked_charge_limit
@@ -146,6 +163,115 @@ class SwitchDeckCoordinator:
                 self.travel_charge_override = False
                 self.backend.set_tdp_limit(handheld_prof.handheld_tdp_watts)
                 self.backend.set_charge_limit(-1)
+
+    def _reconcile_overclock_and_power(
+        self,
+        *,
+        docked_now: bool,
+        ac_online: bool,
+        edid_id: str | None,
+        display_name: str,
+        is_transition: bool,
+        apu_temp_c: float | None,
+        hw_max_tdp_watts: int,
+    ) -> str | None:
+        if docked_now:
+            prof = self.store.get_profile(edid_id, display_name)
+            oc = prof.overclock
+            if not (oc.risk_acknowledged and oc.enabled):
+                self._thermal_throttled = False
+            elif apu_temp_c is not None:
+                if apu_temp_c >= THERMAL_THROTTLE_TRIGGER_C:
+                    self._thermal_throttled = True
+                elif self._thermal_throttled and apu_temp_c <= THERMAL_THROTTLE_RECOVER_C:
+                    self._thermal_throttled = False
+
+            effective_watts = min(
+                oc.boost_tdp_watts,
+                HARD_MAX_OVERCLOCK_TDP_WATTS,
+                max(STOCK_MAX_TDP_WATTS, hw_max_tdp_watts),
+            )
+            should_overclock = False
+            note: str | None = None
+            if not oc.risk_acknowledged:
+                if oc.enabled:
+                    note = "Locked: acknowledge experimental risk in QAM"
+            elif not oc.enabled:
+                note = None
+            elif not ac_online:
+                note = "Standby: AC power required for Docked Overclock"
+            elif self._thermal_throttled:
+                temp_label = (
+                    f"{apu_temp_c:.1f}°C"
+                    if apu_temp_c is not None
+                    else f">= {int(THERMAL_THROTTLE_TRIGGER_C)}°C"
+                )
+                note = f"Thermal step-down ({temp_label} >= 90°C): reverted to <= 15W stock"
+            else:
+                should_overclock = True
+        else:
+            prof = self.store.get_handheld_profile()
+            self._thermal_throttled = False
+            should_overclock = False
+            note = None
+            effective_watts = STOCK_MAX_TDP_WATTS
+            oc = prof.overclock
+
+        if should_overclock:
+            self._apply_power_and_tv(
+                docked_now=docked_now,
+                ac_online=ac_online,
+                edid_id=edid_id,
+                display_name=display_name,
+                is_transition=is_transition,
+                apply_stock_tdp=False,
+            )
+            spec = (effective_watts, oc.gpu_max_mhz, oc.cpu_boost)
+            ac_restored = self._prev_ac_online is False and ac_online
+            if (not self._overclock_active) or (spec != self._last_overclock_spec) or is_transition or ac_restored:
+                applied = self.backend.apply_docked_overclock(
+                    effective_watts, oc.gpu_max_mhz, oc.cpu_boost
+                )
+                if applied:
+                    self._overclock_active = True
+                    self._last_overclock_spec = spec
+                else:
+                    self._overclock_active = False
+                    self._last_overclock_spec = None
+                    note = "Unavailable: amdgpu sysfs or switchdeck-helper missing"
+                    self.backend.set_tdp_limit(min(prof.docked_tdp_watts, STOCK_MAX_TDP_WATTS))
+            if self._overclock_active:
+                if oc.boost_tdp_watts > effective_watts:
+                    note = f"Capped at {effective_watts}W (SMU max {hw_max_tdp_watts}W)"
+                else:
+                    gpu_part = f"GPU <= {oc.gpu_max_mhz}MHz" if oc.gpu_max_mhz >= 1600 else "GPU Auto"
+                    cpu_part = "" if oc.cpu_boost else " · CPU Boost Off"
+                    note = f"Active: {effective_watts}W PPT · {gpu_part}{cpu_part}"
+        else:
+            had_overclock = self._overclock_active
+            if had_overclock:
+                fallback_tdp = (
+                    min(prof.docked_tdp_watts, STOCK_MAX_TDP_WATTS)
+                    if docked_now
+                    else min(prof.handheld_tdp_watts, STOCK_MAX_TDP_WATTS)
+                )
+                self.backend.reset_docked_overclock(fallback_tdp)
+                self._overclock_active = False
+                self._last_overclock_spec = None
+            elif docked_now and self._thermal_throttled:
+                self.backend.set_tdp_limit(min(prof.docked_tdp_watts, STOCK_MAX_TDP_WATTS))
+
+            self._apply_power_and_tv(
+                docked_now=docked_now,
+                ac_online=ac_online,
+                edid_id=edid_id,
+                display_name=display_name,
+                is_transition=is_transition,
+                apply_stock_tdp=not self._thermal_throttled,
+            )
+
+        self._prev_ac_online = ac_online
+        return note
 
     def _apply_scaling(
         self,
@@ -207,6 +333,7 @@ class SwitchDeckCoordinator:
         tdp_watts: int,
         charge_limit: int,
         audio_desc: str | None,
+        overclock_active: bool = False,
     ) -> None:
         if prev_docked is None:
             return
@@ -228,6 +355,7 @@ class SwitchDeckCoordinator:
             "tdp_watts": tdp_watts,
             "charge_limit": charge_limit,
             "audio_sink": audio_desc,
+            "overclock_active": bool(overclock_active),
         }
 
     def reconcile(self) -> DaemonStatus:
@@ -311,13 +439,17 @@ class SwitchDeckCoordinator:
                     display_name=display_name,
                 )
 
-                # 4. Power profiles, battery longevity cap & TV power/input control
-                self._apply_power_and_tv(
+                # 4. Power profiles, guarded runtime overclock, battery cap & TV control
+                apu_temp_c = self.backend.get_apu_temperature_c()
+                hw_max_tdp_watts = self.backend.get_max_sustained_tdp_watts()
+                overclock_note = self._reconcile_overclock_and_power(
                     docked_now=docked_now,
                     ac_online=ac_online,
                     edid_id=edid_id,
                     display_name=display_name,
                     is_transition=is_transition,
+                    apu_temp_c=apu_temp_c,
+                    hw_max_tdp_watts=hw_max_tdp_watts,
                 )
 
                 # 5. Universal Gamescope resolution + FSR/PIXEL scaling
@@ -349,7 +481,17 @@ class SwitchDeckCoordinator:
             )
             builtin_bound = self.backend.is_builtin_controller_bound()
             charge_limit = self.backend.get_charge_limit()
-            tdp_watts = prof.docked_tdp_watts if docked_now else prof.handheld_tdp_watts
+            if docked_now:
+                if self._overclock_active and self._last_overclock_spec is not None:
+                    tdp_watts = self._last_overclock_spec[0]
+                elif self._thermal_throttled or (
+                    prof.overclock.risk_acknowledged and prof.overclock.enabled and not ac_online
+                ):
+                    tdp_watts = min(prof.docked_tdp_watts, STOCK_MAX_TDP_WATTS)
+                else:
+                    tdp_watts = prof.docked_tdp_watts
+            else:
+                tdp_watts = prof.handheld_tdp_watts
 
             self._record_transition_if_needed(
                 prev_docked=prev_docked,
@@ -364,6 +506,7 @@ class SwitchDeckCoordinator:
                 tdp_watts=tdp_watts,
                 charge_limit=charge_limit,
                 audio_desc=audio_desc,
+                overclock_active=self._overclock_active,
             )
 
             return DaemonStatus(
@@ -389,6 +532,11 @@ class SwitchDeckCoordinator:
                     dict(self._last_transition) if self._last_transition is not None else None
                 ),
                 last_error=self._last_error,
+                apu_temp_c=apu_temp_c,
+                hw_max_tdp_watts=hw_max_tdp_watts,
+                overclock_active=self._overclock_active,
+                overclock_thermal_throttled=self._thermal_throttled,
+                overclock_status_note=overclock_note,
             )
 
     def resume_paused_game(self) -> bool:
@@ -453,14 +601,21 @@ class SwitchDeckCoordinator:
                     merged_tv = dict(merged.get("tv") or {})
                     merged_tv.update(tv_patch)
                     merged["tv"] = merged_tv
+                oc_patch = patch.get("overclock")
+                if isinstance(oc_patch, dict):
+                    merged_oc = dict(merged.get("overclock") or {})
+                    merged_oc.update(oc_patch)
+                    merged["overclock"] = merged_oc
                 for key, val in patch.items():
-                    if key not in ("tv", "profile_id"):
+                    if key not in ("tv", "overclock", "profile_id"):
                         merged[key] = val
             updated = DockProfile.from_dict(merged)
             self.store.put_profile(updated)
             self._last_scaling_key = None
             if self.is_docked is True:
-                if self.backend.is_ac_online():
+                if self.backend.is_ac_online() and not (
+                    updated.overclock.risk_acknowledged and updated.overclock.enabled
+                ):
                     self.backend.set_tdp_limit(updated.docked_tdp_watts)
                 target_cap = -1 if self.travel_charge_override else updated.docked_charge_limit
                 self.backend.set_charge_limit(target_cap)
@@ -502,6 +657,10 @@ class SwitchDeckCoordinator:
             try:
                 if self.paused_pid is not None:
                     self.resume_paused_game()
+                if self._overclock_active:
+                    self.backend.reset_docked_overclock(STOCK_MAX_TDP_WATTS)
+                    self._overclock_active = False
+                    self._last_overclock_spec = None
                 self.backend.set_builtin_controller_bound(True)
                 if self.backend.get_deck_model() == DeckModel.JUPITER_LCD:
                     self.backend.set_lcd_bluetooth_wakeup(False)

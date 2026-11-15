@@ -41,6 +41,7 @@ from switchdeck.domain import (
     DeckModel,
     DisplayMode,
     DockProfile,
+    DockedOverclockConfig,
     ExternalController,
     GameWindowState,
     GamescopeFilter,
@@ -51,13 +52,18 @@ from switchdeck.edid import make_synthetic_edid, parse_edid, select_best_output_
 from switchdeck.profiles import ProfileStore, default_config_dir
 from switchdeck.scaling import compute_universal_scaling
 from switchdeck.security import (
+    apply_runtime_overclock_sysfs,
     atomic_write_json,
     capture_process_starttime,
+    find_validated_amdgpu_device,
+    find_validated_amdgpu_hwmon,
+    reset_runtime_overclock_sysfs,
     safe_write_sysfs,
     validate_game_pid,
     validate_hdmi_input,
     validate_host,
     validate_neptune_iface,
+    validate_overclock_args,
     validate_port,
     validate_wakeup_path,
     validate_webhook_url,
@@ -1225,7 +1231,9 @@ class TestDeckyPluginLifecycle(unittest.IsolatedAsyncioTestCase):
 class TestDeckyZipIntegrity(unittest.TestCase):
     def test_decky_zip_package_structure(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
-        zip_path = repo_root / "dist-zip" / "SwitchDeck-v0.2.0.zip"
+        pkg_meta = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
+        version = pkg_meta["version"]
+        zip_path = repo_root / "dist-zip" / f"SwitchDeck-v{version}.zip"
         self.assertTrue(
             zip_path.is_file(),
             f"Missing Decky ZIP at {zip_path}; run ./scripts/build_decky_zip.sh",
@@ -1238,6 +1246,7 @@ class TestDeckyZipIntegrity(unittest.TestCase):
             self.assertIn("SwitchDeck/main.py", names)
 
             plugin_meta = json.loads(zf.read("SwitchDeck/plugin.json").decode("utf-8"))
+            self.assertEqual(plugin_meta.get("name"), "SwitchDeck")
             self.assertIn("root", plugin_meta.get("flags", []))
 
             dist_info = zf.getinfo("SwitchDeck/dist/index.js")
@@ -1246,6 +1255,277 @@ class TestDeckyZipIntegrity(unittest.TestCase):
             for entry in names:
                 self.assertNotIn("__pycache__", entry)
                 self.assertFalse(entry.endswith(".pyc"), f"Unexpected bytecode in ZIP: {entry}")
+                self.assertFalse(entry.endswith(".png"), f"Unexpected PNG screenshot in ZIP: {entry}")
+
+
+class TestDockedOverclockAndGuardrails(unittest.TestCase):
+    def test_overclock_config_clamping_and_strict_bools(self) -> None:
+        prof = DockProfile.from_dict(
+            {
+                "profile_id": "SAM_S90C",
+                "display_name": "SAMSUNG S90C",
+                "overclock": {
+                    "risk_acknowledged": "true",
+                    "enabled": 1,
+                    "boost_tdp_watts": 99,
+                    "gpu_max_mhz": 2400,
+                },
+            }
+        )
+        # Non-bool values must fail closed for risk_acknowledged and enabled
+        self.assertFalse(prof.overclock.risk_acknowledged)
+        self.assertFalse(prof.overclock.enabled)
+        self.assertEqual(prof.overclock.boost_tdp_watts, 22)
+        self.assertEqual(prof.overclock.gpu_max_mhz, 2000)
+        self.assertTrue(prof.overclock.cpu_boost)
+
+        prof_low = DockProfile.from_dict(
+            {
+                "profile_id": "SAM_S90C",
+                "display_name": "SAMSUNG S90C",
+                "overclock": {
+                    "risk_acknowledged": True,
+                    "enabled": True,
+                    "boost_tdp_watts": 9,
+                    "gpu_max_mhz": 900,
+                    "cpu_boost": False,
+                },
+            }
+        )
+        self.assertTrue(prof_low.overclock.risk_acknowledged)
+        self.assertTrue(prof_low.overclock.enabled)
+        self.assertEqual(prof_low.overclock.boost_tdp_watts, 15)
+        self.assertEqual(prof_low.overclock.gpu_max_mhz, 1600)
+        self.assertFalse(prof_low.overclock.cpu_boost)
+
+        prof_auto = DockProfile.from_dict(
+            {
+                "profile_id": "SAM_S90C",
+                "display_name": "SAMSUNG S90C",
+                "overclock": {"gpu_max_mhz": -10},
+            }
+        )
+        self.assertEqual(prof_auto.overclock.gpu_max_mhz, 0)
+
+        cfg = DockedOverclockConfig(
+            risk_acknowledged=True, enabled=True, boost_tdp_watts=20, gpu_max_mhz=1800, cpu_boost=True
+        )
+        self.assertEqual(cfg.boost_tdp_watts, 20)
+
+        self.assertEqual(validate_overclock_args(20, 1800, "0"), (20, 1800, False))
+        for bad_args in [
+            (2, 1800, True),
+            (23, 1800, True),
+            (20.5, 1800, True),
+            (True, 1800, True),
+            (20, 1500, True),
+            (20, 2100, True),
+            (20, True, True),
+        ]:
+            with self.assertRaises(ValueError):
+                validate_overclock_args(*bad_args)
+
+    def test_runtime_overclock_sysfs_apply_reset_and_vendor_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_dir = root / "sys_devices"
+            dev_dir = sys_dir / "pci0000:00" / "0000:00:08.1" / "0000:04:00.0"
+            hwmon_dir = dev_dir / "hwmon" / "hwmon4"
+            drm_card_dev = dev_dir / "drm" / "card1"
+            drm_dir = root / "sys_class_drm"
+            cpu_dir = sys_dir / "system" / "cpu"
+            cpu0_cpufreq = cpu_dir / "cpu0" / "cpufreq"
+
+            hwmon_dir.mkdir(parents=True)
+            drm_card_dev.mkdir(parents=True)
+            drm_dir.mkdir(parents=True)
+            (cpu_dir / "cpufreq").mkdir(parents=True)
+            cpu0_cpufreq.mkdir(parents=True)
+
+            (drm_dir / "card1").symlink_to(drm_card_dev)
+            (drm_card_dev / "device").symlink_to(dev_dir)
+
+            (dev_dir / "vendor").write_text("0x1002\n", encoding="utf-8")
+            (hwmon_dir / "name").write_text("amdgpu\n", encoding="utf-8")
+            (hwmon_dir / "power1_cap_max").write_text("22000000\n", encoding="utf-8")
+            (hwmon_dir / "power1_cap").write_text("15000000\n", encoding="utf-8")
+            (hwmon_dir / "power2_cap_max").write_text("24000000\n", encoding="utf-8")
+            (hwmon_dir / "power2_cap").write_text("15000000\n", encoding="utf-8")
+            (dev_dir / "power_dpm_force_performance_level").write_text("auto\n", encoding="utf-8")
+            (dev_dir / "pp_od_clk_voltage").write_text("OD_SCLK:\n0: 400Mhz\n1: 1600Mhz\n", encoding="utf-8")
+            (cpu_dir / "cpufreq" / "boost").write_text("1\n", encoding="utf-8")
+            (cpu0_cpufreq / "scaling_available_governors").write_text(
+                "powersave performance schedutil\n", encoding="utf-8"
+            )
+            (cpu0_cpufreq / "scaling_governor").write_text("schedutil\n", encoding="utf-8")
+
+            recorded_writes: list[tuple[str, str]] = []
+            real_safe_write = safe_write_sysfs
+
+            def spy_safe_write(path: Path, value: str) -> bool:
+                recorded_writes.append((path.name, value))
+                return real_safe_write(path, value)
+
+            with mock.patch("switchdeck.security.safe_write_sysfs", side_effect=spy_safe_write):
+                ok_apply = apply_runtime_overclock_sysfs(
+                    20,
+                    1800,
+                    False,
+                    drm_root=drm_dir,
+                    cpu_root=cpu_dir,
+                    sys_devices_root=str(sys_dir),
+                )
+                self.assertTrue(ok_apply)
+                self.assertEqual(
+                    recorded_writes,
+                    [
+                        ("power1_cap", "20000000\n"),
+                        ("power2_cap", "22000000\n"),
+                        ("power_dpm_force_performance_level", "manual\n"),
+                        ("pp_od_clk_voltage", "s 0 400\n"),
+                        ("pp_od_clk_voltage", "s 1 1800\n"),
+                        ("pp_od_clk_voltage", "c\n"),
+                        ("boost", "0\n"),
+                        ("scaling_governor", "schedutil\n"),
+                    ],
+                )
+                self.assertEqual((hwmon_dir / "power1_cap").read_text(encoding="utf-8"), "20000000\n")
+
+                recorded_writes.clear()
+                ok_reset = reset_runtime_overclock_sysfs(
+                    15,
+                    drm_root=drm_dir,
+                    cpu_root=cpu_dir,
+                    sys_devices_root=str(sys_dir),
+                )
+                self.assertTrue(ok_reset)
+                self.assertEqual(
+                    recorded_writes,
+                    [
+                        ("power1_cap", "15000000\n"),
+                        ("power2_cap", "15000000\n"),
+                        ("pp_od_clk_voltage", "r\n"),
+                        ("pp_od_clk_voltage", "c\n"),
+                        ("power_dpm_force_performance_level", "auto\n"),
+                        ("boost", "1\n"),
+                        ("scaling_governor", "schedutil\n"),
+                    ],
+                )
+                self.assertEqual((hwmon_dir / "power1_cap").read_text(encoding="utf-8"), "15000000\n")
+
+            # Reject non-AMD GPU vendor IDs
+            (dev_dir / "vendor").write_text("0x8086\n", encoding="utf-8")
+            self.assertIsNone(find_validated_amdgpu_device(drm_root=drm_dir, sys_devices_root=str(sys_dir)))
+            self.assertIsNotNone(hwmon_dir)
+            self.assertFalse(
+                apply_runtime_overclock_sysfs(
+                    20, 1800, True, drm_root=drm_dir, cpu_root=cpu_dir, sys_devices_root=str(sys_dir)
+                )
+            )
+
+    def test_switchdeck_helper_cli_rejects_out_of_bounds_overclock(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        helper = repo_root / "scripts" / "switchdeck-helper"
+        for args in [
+            ["apply-overclock", "25", "1800", "1"],
+            ["apply-overclock", "20", "2500", "1"],
+            ["apply-overclock", "99", "0", "1"],
+        ]:
+            proc = subprocess.run(
+                [sys.executable, str(helper), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0, f"Helper unexpectedly accepted args: {args}")
+
+    def test_coordinator_overclock_gating_thermal_hysteresis_and_resets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = MockHardwareBackend(deck_model=DeckModel.GALILEO_OLED)
+            coord = SwitchDeckCoordinator(backend, store=ProfileStore(Path(tmp)))
+
+            # 1. Dock baseline: overclock disabled by default
+            backend.attach_samsung_s90c_hub(include_24g_xbox_dongle=True, pad_awake=True)
+            s_base = coord.reconcile()
+            self.assertFalse(s_base.overclock_active)
+            self.assertEqual(s_base.tdp_watts, 15)
+
+            # 2. Enabling overclock without risk_acknowledged stays inactive
+            coord.update_active_profile(
+                {
+                    "overclock": {
+                        "enabled": True,
+                        "boost_tdp_watts": 20,
+                        "gpu_max_mhz": 1800,
+                        "cpu_boost": False,
+                    }
+                }
+            )
+            self.assertFalse(backend.overclock_applied)
+            self.assertFalse(coord.reconcile().overclock_active)
+
+            # 3. Unlock risk while AC is offline -> refused
+            backend.ac_online = False
+            coord.update_active_profile({"overclock": {"risk_acknowledged": True}})
+            s_no_ac = coord.reconcile()
+            self.assertFalse(s_no_ac.overclock_active)
+            self.assertLessEqual(s_no_ac.tdp_watts, 15)
+
+            # 4. AC online + docked -> overclock activates
+            backend.ac_online = True
+            s_on = coord.reconcile()
+            self.assertTrue(s_on.overclock_active)
+            self.assertEqual(s_on.tdp_watts, 20)
+            self.assertTrue(backend.overclock_applied)
+            self.assertEqual(backend.gpu_max_mhz, 1800)
+            self.assertFalse(backend.cpu_boost)
+
+            # 5. AC drops mid-dock -> immediately steps back to <= 15W
+            backend.ac_online = False
+            s_ac_drop = coord.reconcile()
+            self.assertFalse(s_ac_drop.overclock_active)
+            self.assertFalse(backend.overclock_applied)
+            self.assertEqual(s_ac_drop.tdp_watts, 15)
+
+            # 6. Restore AC then trigger >= 90C thermal watchdog & 80C hysteresis
+            backend.ac_online = True
+            self.assertTrue(coord.reconcile().overclock_active)
+
+            backend.apu_temp_c = 91.0
+            s_hot = coord.reconcile()
+            self.assertTrue(s_hot.overclock_thermal_throttled)
+            self.assertFalse(s_hot.overclock_active)
+            self.assertEqual(s_hot.tdp_watts, 15)
+            self.assertFalse(backend.overclock_applied)
+
+            # Hysteresis holds throttle at 84C until <= 80C
+            backend.apu_temp_c = 84.0
+            s_warm = coord.reconcile()
+            self.assertTrue(s_warm.overclock_thermal_throttled)
+            self.assertFalse(s_warm.overclock_active)
+
+            backend.apu_temp_c = 79.0
+            s_cool = coord.reconcile()
+            self.assertFalse(s_cool.overclock_thermal_throttled)
+            self.assertTrue(s_cool.overclock_active)
+            self.assertEqual(s_cool.tdp_watts, 20)
+
+            # 7. Undock unconditionally resets overclock
+            backend.detach_hub()
+            s_undock = coord.reconcile()
+            self.assertFalse(s_undock.overclock_active)
+            self.assertFalse(backend.overclock_applied)
+
+            # 8. Re-dock records TransitionPayload.overclock_active, close() resets failsafe
+            backend.attach_samsung_s90c_hub(include_24g_xbox_dongle=True, pad_awake=True)
+            s_redock = coord.reconcile()
+            self.assertTrue(s_redock.overclock_active)
+            self.assertIsNotNone(s_redock.last_transition)
+            self.assertTrue(s_redock.last_transition["overclock_active"])  # type: ignore[index]
+
+            coord.close()
+            self.assertFalse(backend.overclock_applied)
+            self.assertTrue(backend.builtin_bound)
 
 
 if __name__ == "__main__":
