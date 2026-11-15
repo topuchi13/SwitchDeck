@@ -485,44 +485,64 @@ const ZeldaBackdrop: FC<{ isDocked: boolean; activeGameRes: string }> = ({
     style={{
       position: "absolute",
       inset: 0,
-      background:
-        "radial-gradient(circle at 36% 42%, #1d4e68 0%, #102a3d 42%, #09131d 85%, #050a10 100%)",
+      background: "linear-gradient(160deg, #131416 0%, #191816 58%, #151412 100%)",
       overflow: "hidden",
     }}
   >
-    {/* Simulated Hyrule Field / Moon & Clock Tower atmospheric SVG backdrop */}
+    {/* Matte dark architectural topographic & display calibration vector backdrop */}
     <svg
       viewBox="0 0 1280 720"
       preserveAspectRatio="xMidYMid slice"
-      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.86 }}
+      style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
       aria-hidden="true"
     >
       <defs>
-        <linearGradient id="skyGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#091628" />
-          <stop offset="55%" stopColor="#173d59" />
-          <stop offset="100%" stopColor="#26544e" />
-        </linearGradient>
-        <radialGradient id="moonGlow" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stopColor="#fef3c7" stopOpacity="0.95" />
-          <stop offset="45%" stopColor="#fde68a" stopOpacity="0.45" />
-          <stop offset="100%" stopColor="#fde68a" stopOpacity="0" />
-        </radialGradient>
+        <pattern id="calibGrid" width="64" height="64" patternUnits="userSpaceOnUse">
+          <path d="M 64 0 L 0 0 0 64" fill="none" stroke="#222429" strokeWidth="1" />
+        </pattern>
       </defs>
-      <rect width="1280" height="720" fill="url(#skyGrad)" />
-      <circle cx="430" cy="210" r="190" fill="url(#moonGlow)" />
-      <circle cx="430" cy="210" r="56" fill="#fef9c3" opacity="0.9" />
-      <path d="M0 470 Q240 390 520 450 T1020 420 L1280 460 L1280 720 L0 720 Z" fill="#0f282b" />
-      <path d="M0 540 Q330 480 650 530 T1280 510 L1280 720 L0 720 Z" fill="#0b1f22" />
-      {/* Subtle Triforce crest */}
-      <g transform="translate(430, 355)" opacity="0.22">
-        <polygon points="0,-54 -46,24 46,24" fill="#facc15" />
-        <polygon points="-46,24 -92,102 0,102" fill="#facc15" />
-        <polygon points="46,24 0,102 92,102" fill="#facc15" />
+      <rect width="1280" height="720" fill="url(#calibGrid)" opacity="0.65" />
+
+      {/* Subtle topographic horizon ridgelines */}
+      <path
+        d="M0 490 Q240 430 480 468 T960 442 T1280 470"
+        fill="none"
+        stroke="#27292f"
+        strokeWidth="1.2"
+      />
+      <path
+        d="M0 535 Q300 485 600 520 T1280 505"
+        fill="none"
+        stroke="#25272c"
+        strokeWidth="1.2"
+      />
+      <path
+        d="M0 582 Q360 548 720 574 T1280 560"
+        fill="none"
+        stroke="#222428"
+        strokeWidth="1"
+      />
+      {/* Horizon datum reference line */}
+      <line
+        x1="0"
+        y1="382"
+        x2="1280"
+        y2="382"
+        stroke="rgba(255, 90, 38, 0.08)"
+        strokeWidth="1"
+        strokeDasharray="6 6"
+      />
+
+      {/* Crisp thin wireframe geometric Triforce emblem (zero blur / glow) */}
+      <g transform="translate(460, 326)" opacity="0.55">
+        <circle cx="0" cy="48" r="132" fill="none" stroke="#2a2b30" strokeWidth="1" />
+        <polygon points="0,-54 -46,24 46,24" fill="none" stroke="#b8893a" strokeWidth="1.5" />
+        <polygon points="-46,24 -92,102 0,102" fill="none" stroke="#b8893a" strokeWidth="1.5" />
+        <polygon points="46,24 0,102 92,102" fill="none" stroke="#b8893a" strokeWidth="1.5" />
       </g>
     </svg>
 
-    {/* Simulated Game HUD Hearts + Minimap */}
+    {/* Flat Technical In-Game Viewport Overlay */}
     <div
       style={{
         position: "absolute",
@@ -538,11 +558,11 @@ const ZeldaBackdrop: FC<{ isDocked: boolean; activeGameRes: string }> = ({
           <span
             key={idx}
             style={{
-              width: "14px",
-              height: "14px",
-              borderRadius: "4px",
-              background: idx < 7 ? "#ef4444" : "rgba(255,255,255,0.22)",
-              boxShadow: idx < 7 ? "0 0 8px rgba(239,68,68,0.55)" : "none",
+              width: "13px",
+              height: "13px",
+              borderRadius: "2px",
+              background: idx < 7 ? "#d9483b" : "#26282e",
+              border: `1px solid ${idx < 7 ? "#f0695d" : "#343840"}`,
               display: "inline-block",
             }}
           />
@@ -554,20 +574,21 @@ const ZeldaBackdrop: FC<{ isDocked: boolean; activeGameRes: string }> = ({
           alignItems: "center",
           gap: "8px",
           padding: "5px 10px",
-          borderRadius: "8px",
-          background: "rgba(9, 14, 21, 0.72)",
-          border: "1px solid rgba(255,255,255,0.12)",
-          color: "#cbd5e1",
-          fontSize: "11px",
+          borderRadius: "3px",
+          background: "#181a1e",
+          border: "1px solid #32363e",
+          color: COLORS.textSecondary,
+          fontFamily: COLORS.monoFont,
+          fontSize: "10.5px",
           fontWeight: 600,
         }}
       >
-        <span style={{ color: "#facc15", fontWeight: 700 }}>Zelda64Recompiled</span>
+        <span style={{ color: "#d4a64a", fontWeight: 700 }}>Zelda64Recompiled</span>
         <span>·</span>
-        <span>{activeGameRes}</span>
+        <span style={{ color: COLORS.textPrimary }}>{activeGameRes}</span>
         <span>·</span>
-        <span style={{ color: isDocked ? COLORS.neonBlue : COLORS.neonCoral }}>
-          {isDocked ? "16:9 Docked Container" : "16:10 Handheld"}
+        <span style={{ color: isDocked ? COLORS.accent : COLORS.steel }}>
+          {isDocked ? "16:9 DOCKED" : "16:10 HANDHELD"}
         </span>
       </div>
     </div>
@@ -716,7 +737,7 @@ const PreviewApp: FC = () => {
         width: "100vw",
         height: "100vh",
         overflow: "hidden",
-        background: "#060a0f",
+        background: "#121316",
         color: COLORS.textPrimary,
         fontFamily: '"Motiva Sans", "Inter", system-ui, -apple-system, sans-serif',
       }}
@@ -735,9 +756,9 @@ const PreviewApp: FC = () => {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          background: "linear-gradient(180deg, rgba(8, 12, 18, 0.85) 0%, rgba(8, 12, 18, 0) 100%)",
+          background: "linear-gradient(180deg, rgba(19, 20, 22, 0.88) 0%, rgba(19, 20, 22, 0) 100%)",
           fontSize: "12px",
-          color: "#cbd5e1",
+          color: COLORS.textSecondary,
           zIndex: 5,
         }}
       >
@@ -746,10 +767,19 @@ const PreviewApp: FC = () => {
           <span style={{ color: COLORS.textMuted }}>|</span>
           <span>{baseScenario.label}</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "12px", fontWeight: 600 }}>
-          <FaWifi size={12} color={COLORS.neonBlue} />
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+            fontWeight: 600,
+            fontFamily: COLORS.monoFont,
+            fontSize: "11px",
+          }}
+        >
+          <FaWifi size={12} color={COLORS.textSecondary} />
           <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-            <FaBatteryThreeQuarters size={13} color={COLORS.emerald} />
+            <FaBatteryThreeQuarters size={13} color={COLORS.sage} />
             <span>{status.charge_limit > 0 ? `${status.charge_limit}% Cap` : "100%"}</span>
           </span>
           <span>13:24</span>
@@ -771,7 +801,7 @@ const PreviewApp: FC = () => {
         </div>
       )}
 
-      {/* Interactive Scenario Switcher on bottom-left (unobtrusive pill bar) */}
+      {/* Interactive Scenario Switcher on bottom-left (flat industrial tabs) */}
       <div
         style={{
           position: "absolute",
@@ -792,15 +822,15 @@ const PreviewApp: FC = () => {
               type="button"
               onClick={() => selectScenario(key)}
               style={{
-                padding: "5px 10px",
-                borderRadius: "999px",
-                border: `1px solid ${active ? COLORS.neonBlueBorder : "rgba(255,255,255,0.14)"}`,
-                background: active ? "rgba(0, 195, 227, 0.22)" : "rgba(10, 15, 22, 0.78)",
-                color: active ? COLORS.neonBlue : COLORS.textSecondary,
-                fontSize: "11px",
+                padding: "5px 9px",
+                borderRadius: "3px",
+                border: `1px solid ${active ? COLORS.accent : "#32363e"}`,
+                background: active ? "#25282f" : "rgba(20, 22, 26, 0.92)",
+                color: active ? COLORS.textPrimary : COLORS.textSecondary,
+                fontFamily: COLORS.monoFont,
+                fontSize: "10.5px",
                 fontWeight: 600,
                 cursor: "pointer",
-                backdropFilter: "blur(8px)",
               }}
             >
               {SCENARIOS[key].label}
@@ -821,7 +851,7 @@ const PreviewApp: FC = () => {
           display: "flex",
           alignItems: "center",
           gap: "16px",
-          background: "linear-gradient(0deg, rgba(8, 12, 18, 0.9) 0%, rgba(8, 12, 18, 0) 100%)",
+          background: "linear-gradient(0deg, rgba(19, 20, 22, 0.92) 0%, rgba(19, 20, 22, 0) 100%)",
           fontSize: "11px",
           color: COLORS.textSecondary,
           zIndex: 5,
@@ -834,7 +864,7 @@ const PreviewApp: FC = () => {
           <strong style={{ color: COLORS.textPrimary }}>B</strong> Back
         </span>
         <span>
-          <strong style={{ color: COLORS.neonBlue }}>•••</strong> Quick Access
+          <strong style={{ color: COLORS.accent }}>•••</strong> Quick Access
         </span>
       </footer>
 
@@ -848,9 +878,9 @@ const PreviewApp: FC = () => {
           bottom: 0,
           width: "360px",
           boxSizing: "border-box",
-          background: "linear-gradient(180deg, #121923 0%, #0d131a 100%)",
-          borderLeft: "1px solid rgba(255, 255, 255, 0.1)",
-          boxShadow: "-12px 0 36px rgba(0, 0, 0, 0.65)",
+          background: "#181a1e",
+          borderLeft: `1px solid ${COLORS.borderSubtle}`,
+          boxShadow: "-8px 0 28px rgba(0, 0, 0, 0.55)",
           display: "flex",
           flexDirection: "column",
           zIndex: 15,
@@ -865,8 +895,8 @@ const PreviewApp: FC = () => {
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
-            background: "rgba(18, 25, 35, 0.95)",
+            borderBottom: `1px solid ${COLORS.borderSubtle}`,
+            background: "#1c1e23",
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -879,15 +909,17 @@ const PreviewApp: FC = () => {
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             <span
               style={{
+                fontFamily: COLORS.monoFont,
                 fontSize: "10px",
                 fontWeight: 700,
                 color: COLORS.textSecondary,
-                background: "rgba(255,255,255,0.06)",
+                background: COLORS.steelSoft,
+                border: `1px solid ${COLORS.borderSubtle}`,
                 padding: "2px 6px",
-                borderRadius: "4px",
+                borderRadius: "3px",
               }}
             >
-              v0.3.0
+              v0.3.1
             </span>
             <FaEllipsisH size={12} color={COLORS.textSecondary} />
           </div>

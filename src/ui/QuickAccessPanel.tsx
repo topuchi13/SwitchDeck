@@ -46,7 +46,7 @@ export interface QuickAccessPanelProps {
 }
 
 interface FeedbackMessage {
-  tone: "blue" | "coral" | "emerald";
+  tone: "orange" | "crimson" | "sage";
   text: string;
 }
 
@@ -163,16 +163,16 @@ const HeroStatusCard: FC<{
   }
 
   return (
-    <div style={qamStyles.heroCard}>
+    <div style={qamStyles.heroCard(status.is_docked)}>
       <div style={qamStyles.heroHeader}>
         <div style={qamStyles.brandGroup}>
           <SwitchJoyConIcon size={18} />
           <span style={qamStyles.brandTitle}>SwitchDeck</span>
         </div>
         <div style={qamStyles.pillRow}>
-          <span style={qamStyles.pill("slate")}>{formatDeckModelLabel(status.deck_model)}</span>
-          {status.overclock_active && <span style={qamStyles.pill("amber")}>OC</span>}
-          <span style={qamStyles.pill(status.is_docked ? "blue" : "coral")}>
+          <span style={qamStyles.pill("steel")}>{formatDeckModelLabel(status.deck_model)}</span>
+          {status.overclock_active && <span style={qamStyles.pill("ochre")}>OC</span>}
+          <span style={qamStyles.pill(status.is_docked ? "orangeSolid" : "steel")}>
             {status.is_docked ? "Docked" : "Handheld"}
           </span>
           <button
@@ -186,9 +186,9 @@ const HeroStatusCard: FC<{
               justifyContent: "center",
               width: "22px",
               height: "22px",
-              borderRadius: "6px",
+              borderRadius: "3px",
               border: `1px solid ${COLORS.borderSubtle}`,
-              background: "rgba(255,255,255,0.04)",
+              background: COLORS.bgElevated,
               color: COLORS.textSecondary,
               cursor: busy ? "wait" : "pointer",
               padding: 0,
@@ -202,22 +202,22 @@ const HeroStatusCard: FC<{
       <div style={qamStyles.statList}>
         <div style={qamStyles.statRow}>
           <span style={qamStyles.statLabel}>
-            <FaTv size={11} color={status.is_docked ? COLORS.neonBlue : COLORS.neonCoral} />
+            <FaTv size={11} color={status.is_docked ? COLORS.accent : COLORS.textSecondary} />
             <span>Display</span>
           </span>
           <div style={qamStyles.statValueWrap}>
             <span style={qamStyles.statValue}>{displayName}</span>
             <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "flex-end" }}>
               <span style={qamStyles.statSub}>{formatModeLabel(status)}</span>
-              {status.last_scaling?.enable_vrr && <span style={qamStyles.pill("blue")}>VRR</span>}
-              {status.ac_online && <span style={qamStyles.pill("emerald")}>AC</span>}
+              {status.last_scaling?.enable_vrr && <span style={qamStyles.pill("orange")}>VRR</span>}
+              {status.ac_online && <span style={qamStyles.pill("sage")}>AC</span>}
             </div>
           </div>
         </div>
 
         <div style={qamStyles.statRow}>
           <span style={qamStyles.statLabel}>
-            <FaGamepad size={11} color={COLORS.neonBlue} />
+            <FaGamepad size={11} color={primaryExternal ? COLORS.accent : COLORS.textSecondary} />
             <span>Player 1</span>
           </span>
           <div style={qamStyles.statValueWrap}>
@@ -238,7 +238,7 @@ const HeroStatusCard: FC<{
 
         <div style={qamStyles.statRow}>
           <span style={qamStyles.statLabel}>
-            <FaSlidersH size={11} color={COLORS.neonBlue} />
+            <FaSlidersH size={11} color={COLORS.textSecondary} />
             <span>Scaling</span>
           </span>
           <div style={qamStyles.statValueWrap}>
@@ -249,16 +249,16 @@ const HeroStatusCard: FC<{
           </div>
         </div>
 
-        <div style={qamStyles.statRow}>
+        <div style={{ ...qamStyles.statRow, borderBottom: "none" }}>
           <span style={qamStyles.statLabel}>
             <FaBolt
               size={11}
               color={
                 status.overclock_thermal_throttled
-                  ? COLORS.neonCoral
+                  ? COLORS.crimson
                   : status.overclock_active || status.travel_charge_override
-                    ? COLORS.amber
-                    : COLORS.emerald
+                    ? COLORS.ochre
+                    : COLORS.sage
               }
             />
             <span>Power</span>
@@ -293,10 +293,10 @@ const DiagnosticWarningBanner: FC<{ status: DaemonStatus }> = ({ status }) => {
       <div style={qamStyles.warningBody}>
         {status.overclock_thermal_throttled && (
           <div style={{ marginBottom: "5px" }}>
-            <div style={{ fontWeight: 700, color: COLORS.amber }}>
+            <div style={{ fontWeight: 700, color: COLORS.ochre }}>
               Thermal Watchdog Active (&lt;= 15W)
             </div>
-            <div style={{ color: "#cbd5e1" }}>
+            <div style={{ color: COLORS.textSecondary }}>
               APU reached &gt;= 90°C. Docked Overclock automatically stepped down to safe stock
               power until cooling below 80°C.
             </div>
@@ -307,11 +307,11 @@ const DiagnosticWarningBanner: FC<{ status: DaemonStatus }> = ({ status }) => {
             <div style={{ fontWeight: 700, color: COLORS.textPrimary }}>
               [{dongle.usb_id}] {dongle.device_name}
             </div>
-            <div style={{ color: "#cbd5e1" }}>{dongle.remediation}</div>
+            <div style={{ color: COLORS.textSecondary }}>{dongle.remediation}</div>
           </div>
         ))}
         {status.last_error && (
-          <div style={{ color: "#fecaca" }}>Daemon notice: {status.last_error}</div>
+          <div style={{ color: "#f2b8b5" }}>Daemon notice: {status.last_error}</div>
         )}
       </div>
     </div>
@@ -380,7 +380,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       syncProfileDrafts(nextProfile);
     } catch (err) {
       setFeedback({
-        tone: "coral",
+        tone: "crimson",
         text: `Failed refreshing status: ${err instanceof Error ? err.message : String(err)}`,
       });
     } finally {
@@ -419,11 +419,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         const refreshed = await transport.getStatus();
         setStatus(refreshed);
         if (message) {
-          setFeedback({ tone: "blue", text: message });
+          setFeedback({ tone: "orange", text: message });
         }
       } catch (err) {
         setFeedback({
-          tone: "coral",
+          tone: "crimson",
           text: err instanceof Error ? err.message : String(err),
         });
       } finally {
@@ -481,11 +481,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       const next = await transport.setKeepBuiltin(checked);
       setStatus(next);
       setFeedback({
-        tone: "blue",
+        tone: "orange",
         text: checked ? "Built-in Deck controls kept active" : "Smart P1 auto-handoff enabled",
       });
     } catch (err) {
-      setFeedback({ tone: "coral", text: String(err) });
+      setFeedback({ tone: "crimson", text: String(err) });
     } finally {
       setBusy(false);
     }
@@ -497,11 +497,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       const next = await transport.setChargeOverride(checked);
       setStatus(next);
       setFeedback({
-        tone: checked ? "blue" : "emerald",
+        tone: checked ? "orange" : "sage",
         text: checked ? "Travel Charge 100% active until undock" : "80% battery cap restored",
       });
     } catch (err) {
-      setFeedback({ tone: "coral", text: String(err) });
+      setFeedback({ tone: "crimson", text: String(err) });
     } finally {
       setBusy(false);
     }
@@ -518,7 +518,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   const handleAutoNativeAppRes = async () => {
     if (!transport.applyNativeAppResolution) {
       setFeedback({
-        tone: "coral",
+        tone: "crimson",
         text: "Native SteamClient app override unavailable here",
       });
       return;
@@ -530,13 +530,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setFeedback(
       applied
         ? {
-            tone: "emerald",
+            tone: "sage",
             text: dockedNow
               ? `Synced Steam app override to ${targetW}x${targetH}`
               : "Restored Steam app resolution to Default",
           }
         : {
-            tone: "coral",
+            tone: "crimson",
             text: "No running Steam app or SteamClient unavailable",
           },
     );
@@ -547,7 +547,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     try {
       const res = await transport.nudgeDisplay();
       setFeedback({
-        tone: res.ok ? "emerald" : "coral",
+        tone: res.ok ? "sage" : "crimson",
         text: res.ok
           ? "Sent GAMESCOPE_DISPLAY_MODE_NUDGE to HDMI output"
           : "Display nudge returned false (no active Gamescope display)",
@@ -563,11 +563,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       const next = await transport.rebindBuiltin();
       setStatus(next);
       setFeedback({
-        tone: "emerald",
+        tone: "sage",
         text: "Emergency rebind complete: Deck controls (28de:1205) restored",
       });
     } catch (err) {
-      setFeedback({ tone: "coral", text: String(err) });
+      setFeedback({ tone: "crimson", text: String(err) });
     } finally {
       setBusy(false);
     }
@@ -576,7 +576,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   const handlePairSamsung = async (trustNewCert: boolean) => {
     const cleanHost = tvHostDraft.trim();
     if (!cleanHost) {
-      setFeedback({ tone: "coral", text: "Enter TV IP/Hostname before pairing" });
+      setFeedback({ tone: "crimson", text: "Enter TV IP/Hostname before pairing" });
       return;
     }
     setBusy(true);
@@ -595,7 +595,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
           await refreshAll();
         }
         setFeedback({
-          tone: "emerald",
+          tone: "sage",
           text: res.token_saved
             ? `Samsung TV paired & TLS cert pinned (${cleanHost})`
             : `Connected to ${cleanHost} — accept Allow prompt on TV`,
@@ -603,12 +603,12 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       } else {
         setCertMismatch(Boolean(res.cert_mismatch));
         setFeedback({
-          tone: "coral",
+          tone: "crimson",
           text: res.error || "Samsung TV pairing failed",
         });
       }
     } catch (err) {
-      setFeedback({ tone: "coral", text: String(err) });
+      setFeedback({ tone: "crimson", text: String(err) });
     } finally {
       setBusy(false);
     }
@@ -628,13 +628,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       syncProfileDrafts(updated);
       const res = await transport.testTvWake();
       setFeedback({
-        tone: res.ok ? "emerald" : "coral",
+        tone: res.ok ? "sage" : "crimson",
         text: res.ok
           ? "TV wake & input switch signal sent"
           : "TV wake failed — check TV power/network/driver config",
       });
     } catch (err) {
-      setFeedback({ tone: "coral", text: String(err) });
+      setFeedback({ tone: "crimson", text: String(err) });
     } finally {
       setBusy(false);
     }
@@ -643,7 +643,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   if (loading && !status) {
     return (
       <div style={qamStyles.root}>
-        <div style={qamStyles.heroCard}>Loading SwitchDeck hardware state...</div>
+        <div style={qamStyles.heroCard(false)}>Loading SwitchDeck hardware state...</div>
       </div>
     );
   }
@@ -693,19 +693,19 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     );
   };
 
-  let ocPillTone: "amber" | "coral" | "slate" = "slate";
+  let ocPillTone: "ochre" | "crimson" | "steel" = "steel";
   let ocPillLabel = "Stock <= 15W";
   if (status?.overclock_thermal_throttled) {
-    ocPillTone = "coral";
+    ocPillTone = "crimson";
     ocPillLabel = "Thermal Step-Down <= 15W";
   } else if (status?.overclock_active) {
-    ocPillTone = "amber";
+    ocPillTone = "ochre";
     ocPillLabel = "OC Active";
   } else if (oc.enabled && !status?.is_docked) {
-    ocPillTone = "slate";
+    ocPillTone = "steel";
     ocPillLabel = "Standby (Handheld)";
   } else if (oc.enabled && !status?.ac_online) {
-    ocPillTone = "coral";
+    ocPillTone = "crimson";
     ocPillLabel = "Blocked (No AC)";
   }
 
@@ -782,7 +782,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
             onClick={() => void handleRebindBuiltin()}
           >
             <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <FaPlug size={11} color={COLORS.neonCoral} />
+              <FaPlug size={11} color={COLORS.accent} />
               <span>Emergency Rebind Deck Controls</span>
             </span>
           </ButtonItem>
@@ -935,7 +935,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                               gap: "5px",
                               fontSize: "11px",
                               fontWeight: 700,
-                              color: COLORS.emerald,
+                              color: COLORS.sage,
                             }}
                           >
                             <FaShieldAlt size={11} />
@@ -943,13 +943,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                           </span>
                           <div style={{ display: "flex", gap: "4px" }}>
                             {profile.tv_paired && (
-                              <span style={qamStyles.pill("emerald")}>
+                              <span style={qamStyles.pill("sage")}>
                                 <FaCheckCircle size={9} />
                                 <span>Paired</span>
                               </span>
                             )}
                             {hasCertPin && (
-                              <span style={qamStyles.pill("blue")}>
+                              <span style={qamStyles.pill("steel")}>
                                 <FaLock size={9} />
                                 <span>TOFU Pinned</span>
                               </span>
@@ -984,7 +984,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       onClick={() => void handlePairSamsung(false)}
                     >
                       <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaWifi size={11} color={COLORS.neonBlue} />
+                        <FaWifi size={11} color={COLORS.accent} />
                         <span>Pair Samsung TV</span>
                       </span>
                     </ButtonItem>
@@ -1025,7 +1025,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                           display: "flex",
                           alignItems: "center",
                           gap: "6px",
-                          color: COLORS.amber,
+                          color: COLORS.ochre,
                           fontSize: "11.5px",
                           fontWeight: 700,
                           marginBottom: "4px",
@@ -1063,7 +1063,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       }
                     >
                       <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaBolt size={11} color={COLORS.amber} />
+                        <FaBolt size={11} color={COLORS.ochre} />
                         <span>I Understand — Unlock Experimental Controls</span>
                       </span>
                     </ButtonItem>
@@ -1209,7 +1209,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       }}
                     >
                       <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaLock size={11} color={COLORS.neonCoral} />
+                        <FaLock size={11} color={COLORS.crimson} />
                         <span>Reset &amp; Lock Overclock Controls</span>
                       </span>
                     </ButtonItem>

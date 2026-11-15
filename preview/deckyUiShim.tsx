@@ -16,19 +16,19 @@ export interface MultiDropdownOption {
 export type DropdownOption = SingleDropdownOption | MultiDropdownOption;
 
 const sectionTitleStyle: CSSProperties = {
-  fontSize: "10.5px",
+  fontSize: "10px",
   fontWeight: 700,
-  letterSpacing: "0.08em",
+  letterSpacing: "0.09em",
   textTransform: "uppercase",
-  color: COLORS.textSecondary,
+  color: COLORS.textMuted,
   padding: "6px 2px 4px",
-  borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
-  marginBottom: "3px",
+  borderBottom: "1px solid #2a2e35",
+  marginBottom: "4px",
 };
 
 const rowStyle: CSSProperties = {
-  padding: "4px 0",
-  borderBottom: "1px solid rgba(255, 255, 255, 0.04)",
+  padding: "3px 0",
+  borderBottom: "none",
   width: "100%",
   boxSizing: "border-box",
 };
@@ -60,9 +60,10 @@ export const ToggleField: FC<{
       alignItems: "center",
       justifyContent: "space-between",
       gap: "10px",
-      padding: "5px 8px",
-      borderRadius: "7px",
-      background: "rgba(255, 255, 255, 0.025)",
+      padding: "6px 8px",
+      borderRadius: "4px",
+      background: "#1c1e22",
+      border: "1px solid #292d34",
       cursor: disabled ? "not-allowed" : "pointer",
       opacity: disabled ? 0.6 : 1,
       boxSizing: "border-box",
@@ -94,14 +95,15 @@ export const ToggleField: FC<{
     <span
       aria-hidden="true"
       style={{
-        width: "36px",
-        height: "20px",
-        borderRadius: "999px",
-        background: checked ? COLORS.neonBlue : "rgba(148, 163, 184, 0.28)",
+        width: "34px",
+        height: "18px",
+        boxSizing: "border-box",
+        borderRadius: "3px",
+        background: checked ? COLORS.accent : "#2a2e36",
+        border: checked ? `1px solid ${COLORS.accentBright}` : "1px solid #3c414b",
         position: "relative",
         flexShrink: 0,
-        transition: "background 120ms ease",
-        boxShadow: checked ? "0 0 10px rgba(0, 195, 227, 0.35)" : "inset 0 1px 2px rgba(0,0,0,0.4)",
+        transition: "background 120ms ease, border-color 120ms ease",
       }}
     >
       <span
@@ -109,12 +111,11 @@ export const ToggleField: FC<{
           position: "absolute",
           top: "2px",
           left: checked ? "18px" : "2px",
-          width: "16px",
-          height: "16px",
-          borderRadius: "50%",
-          background: "#ffffff",
-          boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
-          transition: "left 120ms ease",
+          width: "12px",
+          height: "12px",
+          borderRadius: "2px",
+          background: checked ? COLORS.accentInk : COLORS.textSecondary,
+          transition: "left 120ms ease, background 120ms ease",
         }}
       />
     </span>
@@ -137,9 +138,10 @@ export const ButtonItem: FC<{
         width: "100%",
         boxSizing: "border-box",
         padding: "7px 10px",
-        borderRadius: "7px",
-        border: "1px solid rgba(255, 255, 255, 0.12)",
-        background: "linear-gradient(180deg, #253140 0%, #1d2734 100%)",
+        borderRadius: "4px",
+        border: "1px solid #383d46",
+        background: "#25282e",
+        boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.04)",
         color: COLORS.textPrimary,
         fontSize: "12px",
         fontWeight: 600,
@@ -188,9 +190,10 @@ export const SliderField: FC<{
 }) => (
   <div
     style={{
-      padding: "5px 8px",
-      borderRadius: "7px",
-      background: "rgba(255, 255, 255, 0.025)",
+      padding: "6px 8px",
+      borderRadius: "4px",
+      background: "#1c1e22",
+      border: "1px solid #292d34",
       boxSizing: "border-box",
       width: "100%",
     }}
@@ -205,7 +208,15 @@ export const SliderField: FC<{
     >
       <span style={{ fontSize: "12px", fontWeight: 600, color: COLORS.textPrimary }}>{label}</span>
       {showValue && (
-        <span style={{ fontSize: "11.5px", fontWeight: 700, color: COLORS.neonBlue }}>
+        <span
+          style={{
+            fontFamily: COLORS.monoFont,
+            fontSize: "11px",
+            fontWeight: 700,
+            color: COLORS.accentBright,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
           {value}
           {valueSuffix}
         </span>
@@ -221,7 +232,7 @@ export const SliderField: FC<{
       onChange={(e) => onChange?.(Number(e.target.value))}
       style={{
         width: "100%",
-        accentColor: COLORS.neonBlue,
+        accentColor: COLORS.accent,
         cursor: disabled ? "not-allowed" : "pointer",
         margin: 0,
       }}
@@ -244,9 +255,10 @@ export const DropdownItem: FC<{
         alignItems: "center",
         justifyContent: "space-between",
         gap: "8px",
-        padding: "5px 8px",
-        borderRadius: "7px",
-        background: "rgba(255, 255, 255, 0.025)",
+        padding: "6px 8px",
+        borderRadius: "4px",
+        background: "#1c1e22",
+        border: "1px solid #292d34",
         boxSizing: "border-box",
         width: "100%",
       }}
@@ -273,9 +285,9 @@ export const DropdownItem: FC<{
           minWidth: 0,
           flex: 1,
           padding: "5px 7px",
-          borderRadius: "6px",
-          border: "1px solid rgba(255, 255, 255, 0.14)",
-          background: "#212b38",
+          borderRadius: "3px",
+          border: "1px solid #383d46",
+          background: COLORS.bgInput,
           color: COLORS.textPrimary,
           fontSize: "11px",
           fontWeight: 600,
@@ -300,9 +312,10 @@ export const TextField: FC<{
 }> = ({ label, placeholder, value = "", disabled, onChange }) => (
   <div
     style={{
-      padding: "5px 8px",
-      borderRadius: "7px",
-      background: "rgba(255, 255, 255, 0.025)",
+      padding: "6px 8px",
+      borderRadius: "4px",
+      background: "#1c1e22",
+      border: "1px solid #292d34",
       boxSizing: "border-box",
       width: "100%",
     }}
@@ -329,12 +342,12 @@ export const TextField: FC<{
         width: "100%",
         boxSizing: "border-box",
         padding: "5px 8px",
-        borderRadius: "6px",
-        border: "1px solid rgba(255, 255, 255, 0.14)",
-        background: "#0d131a",
+        borderRadius: "3px",
+        border: "1px solid #383d46",
+        background: COLORS.bgInput,
         color: COLORS.textPrimary,
         fontSize: "11.5px",
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontFamily: COLORS.monoFont,
       }}
     />
   </div>

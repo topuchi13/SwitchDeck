@@ -1,27 +1,43 @@
 import type { CSSProperties } from "react";
 
 export const COLORS = {
-  bgDeep: "#0e141b",
-  bgCard: "#151d27",
-  bgElevated: "#1a232e",
-  bgGlass: "rgba(14, 20, 27, 0.94)",
-  borderSubtle: "rgba(255, 255, 255, 0.08)",
-  borderStrong: "rgba(255, 255, 255, 0.16)",
-  neonBlue: "#00C3E3",
-  neonBlueSoft: "rgba(0, 195, 227, 0.16)",
-  neonBlueBorder: "rgba(0, 195, 227, 0.44)",
-  neonCoral: "#FF4554",
-  neonCoralSoft: "rgba(255, 69, 84, 0.16)",
-  neonCoralBorder: "rgba(255, 69, 84, 0.46)",
-  emerald: "#34d399",
-  emeraldSoft: "rgba(52, 211, 153, 0.15)",
-  emeraldBorder: "rgba(52, 211, 153, 0.42)",
-  amber: "#fbbf24",
-  amberSoft: "rgba(251, 191, 36, 0.14)",
-  amberBorder: "rgba(251, 191, 36, 0.4)",
-  textPrimary: "#f1f5f9",
-  textSecondary: "#94a3b8",
-  textMuted: "#64748b",
+  // SteamOS OLED Limited Edition matte graphite & warm machined surfaces
+  bgDeep: "#16171a",
+  bgCard: "#1d1f23",
+  bgElevated: "#24272c",
+  bgInput: "#121316",
+  bgGlass: "rgba(26, 28, 32, 0.98)",
+  borderSubtle: "#2e3238",
+  borderStrong: "#40454e",
+
+  // Primary accent: Deck OLED signal orange
+  accent: "#ff5a26",
+  accentBright: "#ff7447",
+  accentInk: "#111214",
+  accentSoft: "rgba(255, 90, 38, 0.14)",
+  accentBorder: "#9e3b1c",
+
+  // Brushed steel (handheld / standby / neutral hardware tags)
+  steel: "#c8ccd4",
+  steelSoft: "#272a30",
+  steelBorder: "#3a3f48",
+
+  // Muted industrial LED telemetry tones
+  sage: "#7ec488",
+  sageSoft: "#1a281e",
+  sageBorder: "#31593b",
+  ochre: "#e5a93c",
+  ochreSoft: "#2a2214",
+  ochreBorder: "#75551e",
+  crimson: "#e04f44",
+  crimsonSoft: "#2a1818",
+  crimsonBorder: "#752d29",
+
+  // Typography hierarchy
+  textPrimary: "#eceae4",
+  textSecondary: "#9ca0a8",
+  textMuted: "#6c7078",
+  monoFont: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace',
 } as const;
 
 export const qamStyles = {
@@ -37,16 +53,17 @@ export const qamStyles = {
     paddingBottom: "24px",
   } satisfies CSSProperties,
 
-  heroCard: {
+  heroCard: (isDocked = false): CSSProperties => ({
     width: "100%",
     boxSizing: "border-box",
-    background: `linear-gradient(155deg, ${COLORS.bgElevated} 0%, ${COLORS.bgDeep} 100%)`,
+    background: COLORS.bgCard,
     border: `1px solid ${COLORS.borderSubtle}`,
-    borderRadius: "10px",
+    borderTop: `2px solid ${isDocked ? COLORS.accent : COLORS.steelBorder}`,
+    borderRadius: "4px",
     padding: "10px 11px",
     marginBottom: "8px",
-    boxShadow: "0 4px 16px rgba(0, 0, 0, 0.32)",
-  } satisfies CSSProperties,
+    boxShadow: "0 2px 8px rgba(0, 0, 0, 0.45)",
+  }),
 
   heroHeader: {
     display: "flex",
@@ -65,9 +82,9 @@ export const qamStyles = {
   } satisfies CSSProperties,
 
   brandTitle: {
-    fontSize: "12px",
+    fontSize: "11.5px",
     fontWeight: 700,
-    letterSpacing: "0.06em",
+    letterSpacing: "0.08em",
     textTransform: "uppercase",
     color: COLORS.textPrimary,
     whiteSpace: "nowrap",
@@ -76,35 +93,35 @@ export const qamStyles = {
   pillRow: {
     display: "flex",
     alignItems: "center",
-    gap: "5px",
+    gap: "4px",
     flexWrap: "wrap",
     justifyContent: "flex-end",
   } satisfies CSSProperties,
 
-  pill: (tone: "blue" | "coral" | "emerald" | "amber" | "slate"): CSSProperties => {
+  pill: (
+    tone: "orangeSolid" | "orange" | "steel" | "sage" | "ochre" | "crimson",
+  ): CSSProperties => {
     const palette = {
-      blue: { bg: COLORS.neonBlueSoft, fg: COLORS.neonBlue, border: COLORS.neonBlueBorder },
-      coral: { bg: COLORS.neonCoralSoft, fg: COLORS.neonCoral, border: COLORS.neonCoralBorder },
-      emerald: { bg: COLORS.emeraldSoft, fg: COLORS.emerald, border: COLORS.emeraldBorder },
-      amber: { bg: COLORS.amberSoft, fg: COLORS.amber, border: COLORS.amberBorder },
-      slate: {
-        bg: "rgba(148, 163, 184, 0.14)",
-        fg: COLORS.textSecondary,
-        border: "rgba(148, 163, 184, 0.28)",
-      },
+      orangeSolid: { bg: COLORS.accent, fg: COLORS.accentInk, border: COLORS.accent },
+      orange: { bg: COLORS.accentSoft, fg: COLORS.accentBright, border: COLORS.accentBorder },
+      steel: { bg: COLORS.steelSoft, fg: COLORS.steel, border: COLORS.steelBorder },
+      sage: { bg: COLORS.sageSoft, fg: COLORS.sage, border: COLORS.sageBorder },
+      ochre: { bg: COLORS.ochreSoft, fg: COLORS.ochre, border: COLORS.ochreBorder },
+      crimson: { bg: COLORS.crimsonSoft, fg: COLORS.crimson, border: COLORS.crimsonBorder },
     }[tone];
     return {
       display: "inline-flex",
       alignItems: "center",
       gap: "4px",
-      padding: "2px 7px",
-      borderRadius: "999px",
+      padding: "2px 6px",
+      borderRadius: "3px",
       background: palette.bg,
       color: palette.fg,
       border: `1px solid ${palette.border}`,
-      fontSize: "10px",
+      fontFamily: COLORS.monoFont,
+      fontSize: "9.5px",
       fontWeight: 700,
-      letterSpacing: "0.04em",
+      letterSpacing: "0.05em",
       textTransform: "uppercase",
       whiteSpace: "nowrap",
       maxWidth: "100%",
@@ -115,7 +132,11 @@ export const qamStyles = {
   statList: {
     display: "flex",
     flexDirection: "column",
-    gap: "6px",
+    gap: 0,
+    background: "#15171b",
+    border: "1px solid #292d34",
+    borderRadius: "4px",
+    overflow: "hidden",
     minWidth: 0,
   } satisfies CSSProperties,
 
@@ -124,10 +145,10 @@ export const qamStyles = {
     alignItems: "flex-start",
     justifyContent: "space-between",
     gap: "8px",
-    padding: "5px 7px",
-    borderRadius: "7px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: "1px solid rgba(255, 255, 255, 0.045)",
+    padding: "6px 8px",
+    borderRadius: 0,
+    background: "transparent",
+    borderBottom: "1px solid #22252b",
     minWidth: 0,
   } satisfies CSSProperties,
 
@@ -164,6 +185,8 @@ export const qamStyles = {
   statSub: {
     color: COLORS.textSecondary,
     fontSize: "10px",
+    fontFamily: COLORS.monoFont,
+    fontVariantNumeric: "tabular-nums",
     wordBreak: "break-word",
     overflowWrap: "anywhere",
     maxWidth: "100%",
@@ -172,9 +195,10 @@ export const qamStyles = {
   warningCard: {
     width: "100%",
     boxSizing: "border-box",
-    background: "linear-gradient(145deg, rgba(255, 69, 84, 0.14), rgba(251, 191, 36, 0.08))",
-    border: `1px solid ${COLORS.neonCoralBorder}`,
-    borderRadius: "9px",
+    background: "#201818",
+    border: "1px solid #4a2a28",
+    borderLeft: `3px solid ${COLORS.crimson}`,
+    borderRadius: "4px",
     padding: "9px 10px",
     marginBottom: "8px",
     color: COLORS.textPrimary,
@@ -184,7 +208,7 @@ export const qamStyles = {
     display: "flex",
     alignItems: "center",
     gap: "6px",
-    color: COLORS.neonCoral,
+    color: COLORS.crimson,
     fontSize: "11.5px",
     fontWeight: 700,
     marginBottom: "4px",
@@ -192,27 +216,43 @@ export const qamStyles = {
 
   warningBody: {
     fontSize: "11px",
-    color: "#e2e8f0",
+    color: COLORS.textPrimary,
     lineHeight: 1.38,
     wordBreak: "break-word",
     overflowWrap: "anywhere",
   } satisfies CSSProperties,
 
-  inlineFeedback: (tone: "blue" | "coral" | "emerald"): CSSProperties => {
+  inlineFeedback: (tone: "orange" | "crimson" | "sage"): CSSProperties => {
     const map = {
-      blue: { bg: COLORS.neonBlueSoft, border: COLORS.neonBlueBorder, fg: COLORS.neonBlue },
-      coral: { bg: COLORS.neonCoralSoft, border: COLORS.neonCoralBorder, fg: COLORS.neonCoral },
-      emerald: { bg: COLORS.emeraldSoft, border: COLORS.emeraldBorder, fg: COLORS.emerald },
+      orange: {
+        bg: COLORS.accentSoft,
+        border: COLORS.accentBorder,
+        accent: COLORS.accent,
+        fg: COLORS.textPrimary,
+      },
+      crimson: {
+        bg: COLORS.crimsonSoft,
+        border: COLORS.crimsonBorder,
+        accent: COLORS.crimson,
+        fg: COLORS.textPrimary,
+      },
+      sage: {
+        bg: COLORS.sageSoft,
+        border: COLORS.sageBorder,
+        accent: COLORS.sage,
+        fg: COLORS.textPrimary,
+      },
     }[tone];
     return {
       width: "100%",
       boxSizing: "border-box",
-      borderRadius: "7px",
+      borderRadius: "4px",
       padding: "6px 9px",
       marginTop: "4px",
       marginBottom: "4px",
       background: map.bg,
       border: `1px solid ${map.border}`,
+      borderLeft: `3px solid ${map.accent}`,
       color: map.fg,
       fontSize: "11px",
       fontWeight: 600,
@@ -224,9 +264,9 @@ export const qamStyles = {
   certCard: {
     width: "100%",
     boxSizing: "border-box",
-    background: "rgba(255, 255, 255, 0.03)",
+    background: "#15171b",
     border: `1px solid ${COLORS.borderSubtle}`,
-    borderRadius: "8px",
+    borderRadius: "4px",
     padding: "6px 9px",
     marginBottom: "2px",
     display: "flex",
@@ -235,7 +275,7 @@ export const qamStyles = {
   } satisfies CSSProperties,
 
   monoCode: {
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    fontFamily: COLORS.monoFont,
     fontSize: "10px",
     color: COLORS.textSecondary,
     wordBreak: "break-all",
@@ -244,9 +284,10 @@ export const qamStyles = {
   overclockWarningCard: {
     width: "100%",
     boxSizing: "border-box",
-    background: "linear-gradient(145deg, rgba(251, 191, 36, 0.14), rgba(255, 69, 84, 0.10))",
-    border: `1px solid ${COLORS.amberBorder}`,
-    borderRadius: "9px",
+    background: "#201c14",
+    border: "1px solid #4d3d1e",
+    borderLeft: `3px solid ${COLORS.ochre}`,
+    borderRadius: "4px",
     padding: "9px 10px",
     marginBottom: "4px",
     color: COLORS.textPrimary,
@@ -255,9 +296,9 @@ export const qamStyles = {
   telemetryCard: {
     width: "100%",
     boxSizing: "border-box",
-    background: "rgba(255, 255, 255, 0.03)",
+    background: "#15171b",
     border: `1px solid ${COLORS.borderSubtle}`,
-    borderRadius: "8px",
+    borderRadius: "4px",
     padding: "7px 9px",
     marginBottom: "2px",
     display: "flex",
@@ -272,14 +313,10 @@ export const toastStyles = {
     maxWidth: "100%",
     boxSizing: "border-box",
     background: COLORS.bgGlass,
-    backdropFilter: "blur(14px)",
-    WebkitBackdropFilter: "blur(14px)",
-    border: `1px solid ${isDocked ? COLORS.neonBlueBorder : COLORS.neonCoralBorder}`,
-    borderRadius: "12px",
-    padding: compact ? "6px 8px" : "11px 13px",
-    boxShadow: isDocked
-      ? "0 12px 32px rgba(0, 0, 0, 0.55), 0 0 22px rgba(0, 195, 227, 0.22)"
-      : "0 12px 32px rgba(0, 0, 0, 0.55), 0 0 22px rgba(255, 69, 84, 0.22)",
+    border: `1px solid ${isDocked ? "#434852" : "#363b44"}`,
+    borderRadius: "4px",
+    padding: compact ? "6px 8px 6px 11px" : "10px 12px 10px 15px",
+    boxShadow: "0 14px 32px rgba(0, 0, 0, 0.75)",
     color: COLORS.textPrimary,
     fontFamily: '"Motiva Sans", "Inter", system-ui, -apple-system, sans-serif',
     overflow: "hidden",
@@ -289,12 +326,10 @@ export const toastStyles = {
   accentStrip: (isDocked: boolean): CSSProperties => ({
     position: "absolute",
     top: 0,
+    bottom: 0,
     left: 0,
-    right: 0,
-    height: "3px",
-    background: isDocked
-      ? `linear-gradient(90deg, ${COLORS.neonBlue} 0%, #38bdf8 65%, ${COLORS.neonCoral} 100%)`
-      : `linear-gradient(90deg, ${COLORS.neonCoral} 0%, #fb7185 65%, ${COLORS.neonBlue} 100%)`,
+    width: "3px",
+    background: isDocked ? COLORS.accent : COLORS.steelBorder,
   }),
 
   topRow: {
@@ -328,27 +363,24 @@ export const toastStyles = {
     alignItems: "center",
   } satisfies CSSProperties,
 
-  chip: (tone: "blue" | "coral" | "slate" | "amber"): CSSProperties => {
+  chip: (tone: "orange" | "steel" | "ochre" | "crimson"): CSSProperties => {
     const map = {
-      blue: { bg: COLORS.neonBlueSoft, fg: COLORS.neonBlue, border: COLORS.neonBlueBorder },
-      coral: { bg: COLORS.neonCoralSoft, fg: COLORS.neonCoral, border: COLORS.neonCoralBorder },
-      amber: { bg: COLORS.amberSoft, fg: COLORS.amber, border: COLORS.amberBorder },
-      slate: {
-        bg: "rgba(255, 255, 255, 0.06)",
-        fg: "#e2e8f0",
-        border: "rgba(255, 255, 255, 0.11)",
-      },
+      orange: { bg: COLORS.accentSoft, fg: COLORS.accentBright, border: COLORS.accentBorder },
+      steel: { bg: COLORS.steelSoft, fg: COLORS.steel, border: COLORS.steelBorder },
+      ochre: { bg: COLORS.ochreSoft, fg: COLORS.ochre, border: COLORS.ochreBorder },
+      crimson: { bg: COLORS.crimsonSoft, fg: COLORS.crimson, border: COLORS.crimsonBorder },
     }[tone];
     return {
       display: "inline-flex",
       alignItems: "center",
       gap: "4px",
-      padding: "2px 7px",
-      borderRadius: "6px",
+      padding: "2px 6px",
+      borderRadius: "3px",
       background: map.bg,
       border: `1px solid ${map.border}`,
       color: map.fg,
-      fontSize: "10.5px",
+      fontFamily: COLORS.monoFont,
+      fontSize: "10px",
       fontWeight: 600,
       maxWidth: "100%",
       boxSizing: "border-box",

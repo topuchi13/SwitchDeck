@@ -12,18 +12,18 @@ export const SwitchJoyConIcon: FC<{ size?: number }> = ({ size = 20 }) => (
     aria-hidden="true"
     style={{ flexShrink: 0 }}
   >
+    {/* Left brushed-steel grip module */}
     <path
-      d="M5.5 4.2C3.84 4.2 2.5 5.54 2.5 7.2V16.8C2.5 18.46 3.84 19.8 5.5 19.8H10.3V4.2H5.5Z"
-      fill={COLORS.neonBlue}
-      fillOpacity={0.92}
+      d="M6.2 4H10.5V20H4.5C3.4 20 2.5 19.1 2.5 18V7.7L6.2 4Z"
+      fill="#d8d5ce"
     />
-    <circle cx="6.4" cy="9.2" r="1.45" fill="#0b1118" />
+    <rect x="5.2" y="8" width="2.8" height="2.8" rx="0.6" fill="#16171a" />
+    {/* Right Deck OLED signal-orange dock module */}
     <path
-      d="M13.7 4.2V19.8H18.5C20.16 19.8 21.5 18.46 21.5 16.8V7.2C21.5 5.54 20.16 4.2 18.5 4.2H13.7Z"
-      fill={COLORS.neonCoral}
-      fillOpacity={0.92}
+      d="M13.5 4H17.8L21.5 7.7V18C21.5 19.1 20.6 20 19.5 20H13.5V4Z"
+      fill={COLORS.accent}
     />
-    <circle cx="17.6" cy="14.2" r="1.45" fill="#0b1118" />
+    <rect x="16" y="13.2" width="2.8" height="2.8" rx="0.6" fill="#16171a" />
   </svg>
 );
 
@@ -47,7 +47,7 @@ export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact 
   return (
     <div style={toastStyles.card(isDocked, compact)}>
       <div style={toastStyles.accentStrip(isDocked)} />
-      <div style={{ ...toastStyles.topRow, marginTop: "2px" }}>
+      <div style={toastStyles.topRow}>
         <div style={toastStyles.titleRow}>
           <SwitchJoyConIcon size={compact ? 18 : 20} />
           <span style={toastStyles.displayTitle}>
@@ -55,9 +55,9 @@ export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact 
           </span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
-          {isOc && <span style={qamStyles.pill("amber")}>OC</span>}
-          {transition.vrr_enabled && <span style={qamStyles.pill("blue")}>VRR</span>}
-          <span style={qamStyles.pill(isDocked ? "blue" : "coral")}>
+          {isOc && <span style={qamStyles.pill("ochre")}>OC</span>}
+          {transition.vrr_enabled && <span style={qamStyles.pill("orange")}>VRR</span>}
+          <span style={qamStyles.pill(isDocked ? "orangeSolid" : "steel")}>
             {isDocked ? "Docked" : "Handheld"}
           </span>
         </div>
@@ -65,27 +65,27 @@ export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact 
 
       <div style={toastStyles.chipsWrap}>
         {transition.output_mode && (
-          <span style={toastStyles.chip(isDocked ? "blue" : "slate")}>
+          <span style={toastStyles.chip(isDocked ? "orange" : "steel")}>
             <FaTv size={10} />
             <span>{transition.output_mode}</span>
           </span>
         )}
-        <span style={toastStyles.chip("slate")}>
+        <span style={toastStyles.chip("steel")}>
           <FaGamepad size={10} />
           <span>P1: {transition.p1_controller}</span>
         </span>
         {transition.scaling_summary && (
-          <span style={toastStyles.chip("slate")}>
+          <span style={toastStyles.chip("steel")}>
             <FaSlidersH size={10} />
             <span>{transition.scaling_summary}</span>
           </span>
         )}
-        <span style={toastStyles.chip(isOc ? "amber" : isDocked ? "blue" : "coral")}>
+        <span style={toastStyles.chip(isOc ? "ochre" : isDocked ? "orange" : "steel")}>
           <FaBolt size={10} />
           <span>{powerLabel}</span>
         </span>
         {transition.audio_sink && (
-          <span style={toastStyles.chip("slate")}>
+          <span style={toastStyles.chip("steel")}>
             <FaVolumeUp size={10} />
             <span>{transition.audio_sink}</span>
           </span>

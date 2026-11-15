@@ -6,7 +6,7 @@ SwitchDeck coordinates controller Player-1 handoffs (`28de:1205` Neptune bind/un
 
 ![SwitchDeck Docked on Samsung S90C with Switch Click-Clack HUD Toast and Decky Quick Access Menu](docs/screenshots/docked_s90c_1920x1080.png)
 
-*Docked on Samsung S90C (`2560x1440@120Hz VRR`): Switch Click-Clack glassmorphism HUD toast + SteamOS Quick Access Menu (`•••`) showing 2.4GHz Xbox Player-1 promotion, `1080p -> 1440p` FSR scaling, and `80%` battery charge cap.*
+*Docked on Samsung S90C (`2560x1440@120Hz VRR`): Switch Click-Clack SteamOS OLED industrial HUD toast + SteamOS Quick Access Menu (`•••`) showing 2.4GHz Xbox Player-1 promotion, `1080p -> 1440p` FSR scaling, and `80%` battery charge cap.*
 
 ---
 
@@ -36,9 +36,9 @@ npm run typecheck && npm run build && npm run preview && ./scripts/build_decky_z
 
 ### Option A — Decky Loader Plugin ZIP (Recommended for Game Mode)
 
-1. Use the direct release URL `https://github.com/topuchi13/SwitchDeck/releases/latest/download/SwitchDeck.zip`, or build `dist-zip/SwitchDeck-v0.3.0.zip` locally via `./scripts/build_decky_zip.sh`.
+1. Use the direct release URL `https://github.com/topuchi13/SwitchDeck/releases/latest/download/SwitchDeck.zip`, or build `dist-zip/SwitchDeck-v0.3.1.zip` locally via `./scripts/build_decky_zip.sh`.
 2. On your Steam Deck in **Game Mode**, open **Settings -> System -> Enable Developer Mode**.
-3. Open **Settings -> Developer -> Install Plugin from URL** and paste the release URL above, or choose **Install Plugin from ZIP** and select `SwitchDeck-v0.3.0.zip`.
+3. Open **Settings -> Developer -> Install Plugin from URL** and paste the release URL above, or choose **Install Plugin from ZIP** and select `SwitchDeck-v0.3.1.zip`.
 4. Open the **Quick Access Menu (`•••`) -> Decky -> SwitchDeck**.
 
 The packaged plugin (`plugin.json` with `"flags": ["root"]`, `main.py`, `dist/index.js`, and `py_modules/switchdeck/`) runs an in-process `AF_NETLINK` uevent listener + 1.5s observer loop directly inside Decky Loader, resolves the `deck` user session for PipeWire/Gamescope/`steamosctl`, stores profiles/tokens in `DECKY_PLUGIN_SETTINGS_DIR` (`0600`), and unconditionally rebinds `28de:1205` in `_unload()` / `_uninstall()`.
@@ -73,7 +73,7 @@ bash ./scripts/uninstall.sh
 | ![Handheld Mode on Steam Deck LCD](docs/screenshots/handheld_1280x800.png) | ![Hardware Driver Alert for 045e:02fe Dongle](docs/screenshots/docked_warning_1920x1080.png) | ![Scaling Profile and Samsung Tizen TOFU TLS Pinning](docs/screenshots/tv_pairing_1280x800.png) |
 | Built-in `28de:1205` bound, `11W` TDP, LCD BT wake locked off | Actionable remediation when `xone`/`xow` driver is missing | Per-display FSR/TDP sliders & SHA-256 TOFU cert pin badges |
 
-- **Switch Click-Clack HUD Toast:** Docking or undocking emits `switchdeck_transition`, playing a synthesized Switch-style rail chime (`src/ui/audioChime.ts`) and displaying a glassmorphism HUD toast (`SwitchToastCard`) summarizing the display, output mode, VRR badge, Player-1 controller, scaling filter, TDP/charge cap, and audio sink.
+- **Switch Click-Clack HUD Toast:** Docking or undocking emits `switchdeck_transition`, playing a synthesized Switch-style rail chime (`src/ui/audioChime.ts`) and displaying an industrial HUD toast (`SwitchToastCard`) summarizing the display, output mode, VRR badge, Player-1 controller, scaling filter, TDP/charge cap, and audio sink.
 - **Hero Status & Alerts:** Displays `Deck LCD` / `Deck OLED`, `Docked` / `Handheld` status, output mode (`VRR`/`AC` pills), Player-1 controller state, active scaling, TDP/charge cap, LCD BT Wake lock state, and actionable warnings (such as proprietary `045e:02fe` Xbox adapters missing `xone`/`xow`).
 - **Quick Controls & Failsafes:**
   - **Keep Built-in Controls** (resets automatically on undock) & **Emergency Rebind Deck Controls**
