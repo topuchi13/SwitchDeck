@@ -36,6 +36,7 @@ def compute_universal_scaling(
     profile: DockProfile,
     consecutive_gpu_overload: int = 0,
     vrr_capable: bool = False,
+    current_adaptive_cap: tuple[int, int] | None = None,
 ) -> ScalingDecision:
     """Choose live Gamescope XWayland size and scaling filter for ANY game.
 
@@ -45,7 +46,7 @@ def compute_universal_scaling(
     - Fixed-config Proton/AAA games locked at 720p/800p -> auto FSR + FIT.
     - Retro low-res games (<= 540p) -> PIXEL + INTEGER scaling.
     - GPU-bound 1080p titles (>= 97% GPU busy across samples) -> adaptive step-down
-      with FSR enabled.
+      with FSR enabled and hysteresis cap retention.
     """
     if not is_docked or output_mode is None:
         return ScalingDecision(
@@ -79,25 +80,6 @@ def compute_universal_scaling(
             reason="docked menu/idle container ready",
         )
 
-    # Adaptive GPU overload step-down (only if enabled and sustained >= 2 ticks)
-    if (
-        profile.adaptive_gpu_downscale
-        and consecutive_gpu_overload >= 2
-        and game.height >= 900
-        and (game.gpu_busy_percent or 0) >= 97
-    ):
-        down_w, down_h = _step_down_resolution(game.width, game.height)
-        return ScalingDecision(
-            target_width=down_w,
-            target_height=down_h,
-            scaling_filter=GamescopeFilter.FSR,
-            scaling_scaler=GamescopeScaler.FIT,
-            fsr_sharpness=profile.fsr_sharpness,
-            allow_super_res=False,
-            enable_vrr=vrr_capable,
-            reason=f"gpu busy {game.gpu_busy_percent}% -> step down to {down_w}x{down_h} + FSR",
-        )
-
     # Retro / pixel-art low-resolution detection (<= 540p)
     if game.height <= 540:
         return ScalingDecision(
@@ -109,6 +91,44 @@ def compute_universal_scaling(
             allow_super_res=False,
             enable_vrr=vrr_capable,
             reason=f"retro {game.width}x{game.height} -> PIXEL + INTEGER",
+        )
+
+    # Respect any active hysteresis step-down cap so we don't oscillate every poll
+    if profile.adaptive_gpu_downscale and current_adaptive_cap is not None:
+        offer_w = min(offer_w, current_adaptive_cap[0])
+        offer_h = min(offer_h, current_adaptive_cap[1])
+
+    # Adaptive GPU overload step-down (only if enabled and sustained >= 2 ticks)
+    if (
+        profile.adaptive_gpu_downscale
+        and consecutive_gpu_overload >= 2
+        and min(game.height, offer_h) >= 900
+        and (game.gpu_busy_percent or 0) >= 97
+    ):
+        base_w = min(game.width, offer_w)
+        base_h = min(game.height, offer_h)
+        down_w, down_h = _step_down_resolution(base_w, base_h)
+        return ScalingDecision(
+            target_width=down_w,
+            target_height=down_h,
+            scaling_filter=GamescopeFilter.FSR,
+            scaling_scaler=GamescopeScaler.FIT,
+            fsr_sharpness=profile.fsr_sharpness,
+            allow_super_res=False,
+            enable_vrr=vrr_capable,
+            reason=f"gpu busy {game.gpu_busy_percent}% -> step down to {down_w}x{down_h} + FSR",
+        )
+
+    if profile.adaptive_gpu_downscale and current_adaptive_cap is not None:
+        return ScalingDecision(
+            target_width=offer_w,
+            target_height=offer_h,
+            scaling_filter=GamescopeFilter.FSR,
+            scaling_scaler=GamescopeScaler.FIT,
+            fsr_sharpness=profile.fsr_sharpness,
+            allow_super_res=False,
+            enable_vrr=vrr_capable,
+            reason=f"holding adaptive cap {offer_w}x{offer_h} + FSR",
         )
 
     # Sub-native game window (e.g., locked 720p/800p on 1080p/4K TV, or 1080p on 4K TV)

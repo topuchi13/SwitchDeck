@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Minimal validated root sysfs helper for SwitchDeck.
 
 Permits ONLY strictly validated runtime operations without running the full daemon as root:
-1. bind-neptune / unbind-neptune for verified Valve 28de:1205 usbhid interfaces.
-2. set-wakeup (enabled|disabled) on validated /sys/devices/.../power/wakeup nodes.
+1. bind-neptune / unbind-neptune / rebind-all-neptune for verified Valve 28de:1205 usbhid interfaces.
+2. set-wakeup (enabled|disabled) on validated /sys/devices/.../power/wakeup USB nodes.
 3. apply-overclock / reset-overclock on validated amdgpu hwmon/OD/cpufreq nodes (volatile only).
 """
 
@@ -69,6 +69,15 @@ def validate_wakeup_path(target: str, sys_devices_root: str = SYS_DEVICES_ROOT) 
     resolved = _resolve_under_root(target, root_real)
     if resolved is None or not os.fspath(resolved).endswith("/power/wakeup"):
         return None
+    rel_parts = resolved.relative_to(Path(root_real.rstrip("/"))).parts
+    usb_dev_dir = resolved.parent.parent
+    has_id_vendor = (usb_dev_dir / "idVendor").is_file()
+    if root_real.rstrip("/") == os.path.realpath("/sys/devices"):
+        if not has_id_vendor:
+            return None
+    else:
+        if not (has_id_vendor or any(part.lower().startswith("usb") for part in rel_parts)):
+            return None
     return resolved
 
 
@@ -173,15 +182,77 @@ def _write_cpufreq(boost_enabled: bool, governor: str, root_real: str, cpu_root:
         safe_write_sysfs(real_gov, f"{chosen}\n")
 
 
+def _find_neptune_ifaces(usb_devices_root: Path = USB_DEVICES_DIR) -> list[str]:
+    bus_ports: list[str] = []
+    try:
+        entries = sorted(usb_devices_root.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            vid = (entry / "idVendor").read_text(encoding="utf-8", errors="replace").strip().lower()
+            pid = (entry / "idProduct").read_text(encoding="utf-8", errors="replace").strip().lower()
+            if vid == "28de" and pid == "1205":
+                bus_ports.append(entry.name)
+        except OSError:
+            continue
+
+    ifaces: list[str] = []
+    for bus_port in bus_ports:
+        dev_dir = usb_devices_root / bus_port
+        try:
+            for sub in sorted(dev_dir.iterdir()):
+                if sub.is_dir() and sub.name.startswith(f"{bus_port}:1."):
+                    if validate_neptune_iface(sub.name, usb_devices_root=usb_devices_root):
+                        ifaces.append(sub.name)
+        except OSError:
+            continue
+    return ifaces
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 3:
+    # Defense-in-depth even if invoked without -I in unit tests
+    for bad_var in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+        os.environ.pop(bad_var, None)
+    sys.path[:] = [
+        p
+        for p in sys.path
+        if p and not p.startswith(("/home/", "/var/home/"))
+    ]
+
+    if len(argv) < 2:
         print(
-            "Usage: switchdeck-helper <bind-neptune|unbind-neptune|set-wakeup|apply-overclock|reset-overclock> ...",
+            "Usage: switchdeck-helper <bind-neptune|unbind-neptune|rebind-all-neptune|set-wakeup|apply-overclock|reset-overclock> ...",
             file=sys.stderr,
         )
         return 2
 
-    action, target = argv[1], argv[2]
+    action = argv[1]
+    if action == "rebind-all-neptune":
+        if len(argv) != 2:
+            print("Usage: switchdeck-helper rebind-all-neptune", file=sys.stderr)
+            return 2
+        ifaces = _find_neptune_ifaces()
+        for iface in ifaces:
+            if (USB_HID_DIR / iface).exists():
+                continue
+            try:
+                safe_write_sysfs(USB_HID_DIR / "bind", iface)
+            except OSError as exc:
+                print(f"rebind failed for {iface}: {exc}", file=sys.stderr)
+                return 1
+        return 0
+
+    if len(argv) < 3:
+        print(
+            "Usage: switchdeck-helper <bind-neptune|unbind-neptune|rebind-all-neptune|set-wakeup|apply-overclock|reset-overclock> ...",
+            file=sys.stderr,
+        )
+        return 2
+
+    target = argv[2]
     if action in ("bind-neptune", "unbind-neptune"):
         if len(argv) != 3:
             print("Usage: switchdeck-helper <bind-neptune|unbind-neptune> <iface>", file=sys.stderr)
@@ -227,15 +298,16 @@ def main(argv: list[str]) -> int:
             return 1
         dev_dir, hwmon_dir, root_real = located
         try:
+            p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+            if p2_path is not None and p2_path.exists():
+                p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 24_000_000
+                safe_write_sysfs(p2_path, f"{min((watts_val + 2) * 1_000_000, p2_max_uw, 24_000_000)}\n")
+
             p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 22_000_000
             p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
             if p1_path is None or not p1_path.exists():
                 return 1
             safe_write_sysfs(p1_path, f"{min(watts_val * 1_000_000, p1_max_uw)}\n")
-            p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
-            if p2_path is not None and p2_path.exists():
-                p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 24_000_000
-                safe_write_sysfs(p2_path, f"{min((watts_val + 2) * 1_000_000, p2_max_uw, 24_000_000)}\n")
 
             dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
             pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
@@ -244,10 +316,17 @@ def main(argv: list[str]) -> int:
                 safe_write_sysfs(pp_od, "s 0 400\n")
                 safe_write_sysfs(pp_od, f"s 1 {gpu_mhz}\n")
                 safe_write_sysfs(pp_od, "c\n")
-            elif gpu_mhz == 0 and dpm_level and dpm_level.exists():
-                safe_write_sysfs(dpm_level, "auto\n")
+            elif gpu_mhz == 0:
+                if pp_od is not None and pp_od.exists():
+                    try:
+                        safe_write_sysfs(pp_od, "r\n")
+                        safe_write_sysfs(pp_od, "c\n")
+                    except OSError:
+                        pass
+                if dpm_level is not None and dpm_level.exists():
+                    safe_write_sysfs(dpm_level, "auto\n")
 
-            _write_cpufreq(boost_flag, "performance" if boost_flag else "schedutil", root_real)
+            _write_cpufreq(boost_flag, "schedutil", root_real)
             return 0
         except OSError as exc:
             print(f"overclock sysfs write failed: {exc}", file=sys.stderr)
@@ -269,29 +348,47 @@ def main(argv: list[str]) -> int:
             print("No validated amdgpu device found", file=sys.stderr)
             return 1
         dev_dir, hwmon_dir, root_real = located
-        try:
-            p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 15_000_000
-            p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
-            if p1_path is None or not p1_path.exists():
-                return 1
-            safe_write_sysfs(p1_path, f"{min(watts_val * 1_000_000, p1_max_uw)}\n")
-            p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
-            if p2_path is not None and p2_path.exists():
+        ok = True
+
+        p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 15_000_000
+        p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+        if p1_path is None or not p1_path.exists():
+            ok = False
+        else:
+            try:
+                safe_write_sysfs(p1_path, f"{min(watts_val * 1_000_000, p1_max_uw)}\n")
+            except OSError as exc:
+                print(f"power1_cap reset failed: {exc}", file=sys.stderr)
+                ok = False
+
+        p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
+        if p2_path is not None and p2_path.exists():
+            try:
                 p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 15_000_000
                 safe_write_sysfs(p2_path, f"{min(watts_val * 1_000_000, p2_max_uw)}\n")
+            except OSError:
+                pass
 
-            pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
-            if pp_od is not None and pp_od.exists():
+        pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
+        if pp_od is not None and pp_od.exists():
+            try:
                 safe_write_sysfs(pp_od, "r\n")
                 safe_write_sysfs(pp_od, "c\n")
-            dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
-            if dpm_level is not None and dpm_level.exists():
+            except OSError:
+                pass
+
+        dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
+        if dpm_level is not None and dpm_level.exists():
+            try:
                 safe_write_sysfs(dpm_level, "auto\n")
+            except OSError:
+                pass
+
+        try:
             _write_cpufreq(True, "schedutil", root_real)
-            return 0
-        except OSError as exc:
-            print(f"reset-overclock failed: {exc}", file=sys.stderr)
-            return 1
+        except OSError:
+            pass
+        return 0 if ok else 1
 
     print(f"Unknown action: {action}", file=sys.stderr)
     return 2

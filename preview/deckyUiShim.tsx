@@ -1,5 +1,51 @@
-import type { ChangeEvent, CSSProperties, FC, ReactNode } from "react";
+import type { ChangeEvent, CSSProperties, FC, KeyboardEvent, ReactNode } from "react";
 import { COLORS } from "../src/ui/styles";
+
+export const Router: { MainRunningApp?: { appid?: number | string } } = {};
+
+export const Focusable: FC<{
+  children?: ReactNode;
+  style?: CSSProperties;
+  className?: string;
+  role?: string;
+  tabIndex?: number;
+  "aria-label"?: string;
+  onActivate?: () => void;
+  onClick?: () => void;
+}> = ({
+  children,
+  style,
+  className,
+  role = "button",
+  tabIndex = 0,
+  "aria-label": ariaLabel,
+  onActivate,
+  onClick,
+}) => {
+  const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (onActivate) {
+        onActivate();
+      } else {
+        onClick?.();
+      }
+    }
+  };
+  return (
+    <div
+      role={role}
+      tabIndex={tabIndex}
+      aria-label={ariaLabel}
+      className={className}
+      style={style}
+      onClick={() => onClick?.()}
+      onKeyDown={handleKeyDown}
+    >
+      {children}
+    </div>
+  );
+};
 
 export interface SingleDropdownOption {
   data: unknown;
@@ -308,8 +354,9 @@ export const TextField: FC<{
   placeholder?: string;
   value?: string;
   disabled?: boolean;
+  bIsPassword?: boolean;
   onChange?: (e: ChangeEvent<HTMLInputElement>) => void;
-}> = ({ label, placeholder, value = "", disabled, onChange }) => (
+}> = ({ label, placeholder, value = "", disabled, bIsPassword, onChange }) => (
   <div
     style={{
       padding: "6px 8px",
@@ -333,7 +380,7 @@ export const TextField: FC<{
       </div>
     )}
     <input
-      type="text"
+      type={bIsPassword ? "password" : "text"}
       value={value}
       placeholder={placeholder}
       disabled={disabled}

@@ -970,7 +970,7 @@ const PreviewApp: FC = () => {
                 borderRadius: "3px",
               }}
             >
-              v0.4.0
+              v0.4.1
             </span>
             <FaEllipsisH size={12} color={COLORS.textSecondary} />
           </div>

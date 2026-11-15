@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ctypes
 import glob
+import logging
 import os
 import re
 import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from ..domain import (
 from ..edid import parse_edid
 from ..security import (
     apply_runtime_overclock_sysfs,
+    capture_process_starttime,
     find_validated_amdgpu_device,
     find_validated_amdgpu_hwmon,
     reset_runtime_overclock_sysfs,
@@ -37,6 +40,19 @@ from ..security import (
     validate_wakeup_path,
 )
 from ..session import UserSessionContext, resolve_user_session
+
+log = logging.getLogger(__name__)
+
+KNOWN_24G_DONGLE_USB_IDS = frozenset(
+    {
+        "045e:02fe",
+        "045e:02e6",
+        "045e:0b12",
+        "2dc8:3106",
+        "2dc8:3109",
+        "2dc8:301b",
+    }
+)
 
 VALVE_VENDOR = "28de"
 NEPTUNE_PRODUCT = "1205"
@@ -183,6 +199,13 @@ class LinuxHardwareBackend:
             if _read_text(Path(status_file)) != "connected":
                 continue
 
+            edid = None
+            try:
+                edid_bytes = (conn_dir / "edid").read_bytes()
+                edid = parse_edid(edid_bytes)
+            except OSError:
+                pass
+
             modes: list[DisplayMode] = []
             modes_raw = _read_text(conn_dir / "modes")
             for idx, line in enumerate(modes_raw.splitlines()):
@@ -190,16 +213,14 @@ class LinuxHardwareBackend:
                 if not m:
                     continue
                 w, h = int(m.group(1)), int(m.group(2))
-                hz_list = xrandr_rates.get((w, h)) or [60.0]
+                fallback_hz = (
+                    edid.native_refresh_hz
+                    if edid is not None and (w, h) == (edid.native_width, edid.native_height)
+                    else 60.0
+                )
+                hz_list = xrandr_rates.get((w, h)) or [fallback_hz]
                 for hz in sorted(set(hz_list), reverse=True):
                     modes.append(DisplayMode(width=w, height=h, refresh_hz=hz, preferred=(idx == 0)))
-
-            edid = None
-            try:
-                edid_bytes = (conn_dir / "edid").read_bytes()
-                edid = parse_edid(edid_bytes)
-            except OSError:
-                pass
 
             vrr_capable = _read_text(conn_dir / "vrr_capable") == "1"
             connectors.append(
@@ -213,16 +234,46 @@ class LinuxHardwareBackend:
             )
         return connectors
 
-    def _classify_transport(self, real_path: str, vendor: str, product: str) -> str:
+    def _read_usb_metadata(self, input_dir: Path) -> tuple[str, str, str, str]:
+        cur = input_dir / "device"
+        for _ in range(6):
+            if not cur.exists():
+                break
+            vid = _read_text(cur / "idVendor").lower()
+            pid = _read_text(cur / "idProduct").lower()
+            prod = _read_text(cur / "product")
+            iface = _read_text(cur / "interface")
+            if vid or pid or prod or iface:
+                return vid, pid, prod, iface
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+        return "", "", "", ""
+
+    def _classify_transport(
+        self,
+        real_path: str,
+        vendor: str,
+        product: str,
+        name: str = "",
+        usb_meta: tuple[str, str, str, str] = ("", "", "", ""),
+        bus_type: str = "",
+    ) -> str:
         if vendor == VALVE_VENDOR and product in PUCK_PRODUCTS:
             return "puck"
         if "/devices/virtual/" in real_path:
             return "uinput"
-        if "/uhid/" in real_path or "/bluetooth/" in real_path:
+        if "/uhid/" in real_path or "/bluetooth/" in real_path or bus_type.lower() == "0005":
             return "bluetooth"
-        if any(tag in real_path.lower() for tag in ("wireless", "dongle", "2.4g", "receiver")):
+        usb_vid, usb_pid, usb_prod, usb_iface = usb_meta
+        vid_pid = f"{usb_vid or vendor}:{usb_pid or product}".lower()
+        meta_blob = f"{name} {usb_prod} {usb_iface} {real_path}".lower()
+        if vid_pid in KNOWN_24G_DONGLE_USB_IDS or any(
+            tag in meta_blob for tag in ("wireless", "dongle", "2.4g", "receiver", "adapter")
+        ):
             return "dongle_24g"
-        if "/usb" in real_path:
+        if "/usb" in real_path or bus_type.lower() == "0003":
             return "usb"
         return "other"
 
@@ -260,6 +311,7 @@ class LinuxHardwareBackend:
         """Close all open persistent dongle watcher file descriptors."""
         for key in list(self._dongle_watch_fds):
             self._close_watcher_fd(key)
+        self._dongle_active_until.clear()
 
     def _is_dongle_actively_awake(self, input_dir: Path, transport: str) -> tuple[bool, int]:
         wakeup_raw = _read_text(input_dir / "device" / "power" / "wakeup_count")
@@ -278,10 +330,6 @@ class LinuxHardwareBackend:
         elif wakeup_count > prev:
             self._dongle_wakeup_baseline[key] = wakeup_count
             self._dongle_active_until[key] = now + 3600.0
-
-        if self._dongle_active_until.get(key, 0.0) > now:
-            self._close_watcher_fd(key)
-            return True, wakeup_count
 
         if key not in self._dongle_watch_fds:
             event_nodes = sorted(input_dir.glob("event*"))
@@ -302,6 +350,9 @@ class LinuxHardwareBackend:
                 got_bytes = False
                 dead_fd = False
                 for _, revents in events:
+                    if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                        dead_fd = True
+                        break
                     if revents & select.POLLIN:
                         for _ in range(64):
                             try:
@@ -314,16 +365,22 @@ class LinuxHardwareBackend:
                             got_bytes = True
                             if len(chunk) < 4096:
                                 break
-                    if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
-                        dead_fd = True
-                if got_bytes:
-                    self._dongle_active_until[key] = now + 3600.0
-                    self._close_watcher_fd(key)
-                    return True, wakeup_count
+                        if dead_fd:
+                            break
                 if dead_fd:
                     self._close_watcher_fd(key)
+                    self._dongle_active_until.pop(key, None)
+                    return False, wakeup_count
+                if got_bytes:
+                    self._dongle_active_until[key] = now + 3600.0
+                    return True, wakeup_count
             except OSError:
                 self._close_watcher_fd(key)
+                self._dongle_active_until.pop(key, None)
+                return False, wakeup_count
+
+        if self._dongle_active_until.get(key, 0.0) > now:
+            return True, wakeup_count
 
         return False, wakeup_count
 
@@ -350,7 +407,16 @@ class LinuxHardwareBackend:
                 continue
 
             name = _read_text(input_dir / "name") or input_dir.name
-            transport = self._classify_transport(real_path, vendor, product)
+            bus_type = _read_text(input_dir / "id" / "bustype")
+            usb_meta = self._read_usb_metadata(input_dir)
+            transport = self._classify_transport(
+                real_path,
+                vendor,
+                product,
+                name=name,
+                usb_meta=usb_meta,
+                bus_type=bus_type,
+            )
             seen_keys.add(str(input_dir))
             awake, wake_count = self._is_dongle_actively_awake(input_dir, transport)
             event_nodes = sorted(input_dir.glob("event*"))
@@ -414,10 +480,21 @@ class LinuxHardwareBackend:
             ):
                 for iface in sorted(usb_dir.glob(f"{usb_dir.name}:1.*")):
                     interfaces.append(iface.name)
-        return interfaces or ["3-3:1.0", "3-3:1.1", "3-3:1.2"]
+        if interfaces:
+            return interfaces
+        fallback_dev = Path("/sys/bus/usb/devices/3-3")
+        if (
+            _read_text(fallback_dev / "idVendor").lower() == VALVE_VENDOR
+            and _read_text(fallback_dev / "idProduct").lower() == NEPTUNE_PRODUCT
+        ):
+            return ["3-3:1.0", "3-3:1.1", "3-3:1.2"]
+        return []
 
     def is_builtin_controller_bound(self) -> bool:
-        return any((USB_HID_DRIVER / iface).exists() for iface in self._find_neptune_usb_interfaces())
+        interfaces = self._find_neptune_usb_interfaces()
+        if not interfaces:
+            return True
+        return all((USB_HID_DRIVER / iface).exists() for iface in interfaces)
 
     def set_builtin_controller_bound(self, bound: bool) -> bool:
         interfaces = self._find_neptune_usb_interfaces()
@@ -435,6 +512,8 @@ class LinuxHardwareBackend:
         nodes: list[Path] = []
         for usb_str in sorted(glob.glob("/sys/bus/usb/devices/*/power/wakeup")):
             wakeup_file = Path(usb_str)
+            if _read_text(wakeup_file) not in ("enabled", "disabled"):
+                continue
             dev_dir = wakeup_file.parent.parent
             prod = _read_text(dev_dir / "product").lower()
             cls = _read_text(dev_dir / "bDeviceClass").lower()
@@ -457,37 +536,49 @@ class LinuxHardwareBackend:
 
     def _classify_sink_kind(self, text: str) -> str:
         low = text.lower()
-        if "bluez" in low:
+        if any(tag in low for tag in ("bluez", "bluetooth", "headset", "buds", "airpods", "xm4", "xm5")):
             return "bluetooth"
-        if "hdmi" in low or "displayport" in low or "dp-" in low:
+        if any(tag in low for tag in ("hdmi", "displayport", "eld", "dp-", "iec958", "pro-output-3", "pro-output-7")):
             return "hdmi"
-        if "acp5x" in low or "speaker" in low or "vangogh" in low or "nau8821" in low:
+        if any(
+            tag in low
+            for tag in ("acp5x", "speaker", "vangogh", "nau8821", "filter-chain", "filter chain", "virtual sink", "valve")
+        ):
             return "speakers"
         if "usb" in low:
             return "usb"
         return "other"
 
     def get_audio_state(self) -> AudioState:
-        rc, out = self.session.run_user_cmd(["wpctl", "status"])
+        rc, out = self.session.run_user_cmd(["wpctl", "status", "--name"])
+        if rc != 0 or "Sinks:" not in out:
+            rc, out = self.session.run_user_cmd(["wpctl", "status"])
         sinks: list[AudioSink] = []
         default_sink: AudioSink | None = None
         if rc == 0:
             in_audio = False
             in_sinks = False
             for line in out.splitlines():
+                stripped = line.strip()
                 if line.startswith("Audio"):
                     in_audio = True
                     continue
-                if in_audio and line.startswith("Video"):
+                if in_audio and line and not line[0].isspace() and not line.startswith("Audio"):
                     break
                 if in_audio and "Sinks:" in line:
                     in_sinks = True
                     continue
-                if in_sinks and ("Sources:" in line or "Filters:" in line or "Streams:" in line):
+                if in_sinks and (
+                    "Sources:" in stripped
+                    or "Sink endpoints:" in stripped
+                    or "Source endpoints:" in stripped
+                    or "Filters:" in stripped
+                    or "Streams:" in stripped
+                ):
                     in_sinks = False
                     continue
                 if in_sinks:
-                    m = re.search(r"(\*)?\s*(\d+)\.\s+(.+?)\s*(?:\[vol:\s*([0-9.]+).*\])?$", line)
+                    m = re.search(r"(\*)?\s*(\d+)\.\s+(.+?)\s*(?:\[vol:\s*([0-9.,]+).*\])?$", line)
                     if not m:
                         continue
                     is_def = m.group(1) == "*"
@@ -508,9 +599,9 @@ class LinuxHardwareBackend:
         muted = False
         rc_v, v_out = self.session.run_user_cmd(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
         if rc_v == 0:
-            vm = re.search(r"Volume:\s*([0-9.]+)", v_out)
+            vm = re.search(r"Volume:\s*([0-9]+[.,][0-9]+)", v_out)
             if vm:
-                vol = float(vm.group(1))
+                vol = float(vm.group(1).replace(",", "."))
             muted = "[MUTED]" in v_out
         return AudioState(sinks=tuple(sinks), default_sink=default_sink, volume=vol, muted=muted)
 
@@ -519,11 +610,7 @@ class LinuxHardwareBackend:
         wp_dir = base_cfg / "wireplumber"
         conf_dir = wp_dir / "wireplumber.conf.d"
         conf_path = conf_dir / "51-switchdeck-keepalive.conf"
-        if conf_path.exists() or conf_path.is_symlink():
-            return
-        created_dirs = [d for d in (base_cfg, wp_dir, conf_dir) if not d.exists()]
-        conf_dir.mkdir(parents=True, exist_ok=True)
-        conf_path.write_text(
+        payload = (
             'monitor.alsa.rules = [\n'
             '  {\n'
             '    matches = [\n'
@@ -537,19 +624,55 @@ class LinuxHardwareBackend:
             '      }\n'
             '    }\n'
             '  }\n'
-            ']\n',
-            encoding="utf-8",
+            ']\n'
         )
-        if self.session.is_root_host:
-            for d in created_dirs:
-                try:
-                    os.chown(d, self.session.uid, self.session.gid)
-                except (PermissionError, OSError, AttributeError):
-                    pass
+        try:
+            for check_dir in (self.session.home_dir, base_cfg, wp_dir, conf_dir, conf_path):
+                if os.path.lexists(check_dir) and check_dir.is_symlink():
+                    log.warning("Refusing WirePlumber keepalive write across symlink: %s", check_dir)
+                    return
+            if conf_path.exists():
+                return
+
+            created_dirs: list[Path] = []
+            for d in (base_cfg, wp_dir, conf_dir):
+                if not d.exists():
+                    d.mkdir(mode=0o755, exist_ok=True)
+                    created_dirs.append(d)
+
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".51-switchdeck-keepalive.",
+                dir=str(conf_dir),
+            )
             try:
-                os.chown(conf_path, self.session.uid, self.session.gid)
-            except (PermissionError, OSError, AttributeError):
-                pass
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fchmod(handle.fileno(), 0o644)
+                    if self.session.is_root_host:
+                        try:
+                            os.fchown(handle.fileno(), self.session.uid, self.session.gid)
+                        except (PermissionError, OSError, AttributeError):
+                            pass
+                    os.fsync(handle.fileno())
+                if os.path.lexists(conf_path) and conf_path.is_symlink():
+                    raise OSError(f"Refusing symlink target {conf_path}")
+                os.replace(tmp_name, conf_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+
+            if self.session.is_root_host:
+                for d in created_dirs:
+                    try:
+                        os.chown(d, self.session.uid, self.session.gid, follow_symlinks=False)
+                    except (PermissionError, OSError, AttributeError):
+                        pass
+        except OSError as exc:
+            log.warning("Failed to write WirePlumber keepalive: %s", exc)
 
     def set_default_audio_sink(self, sink_id: int) -> bool:
         rc, _ = self.session.run_user_cmd(["wpctl", "set-default", str(sink_id)])
@@ -577,7 +700,9 @@ class LinuxHardwareBackend:
             return None
         raw = _read_text(hwmon / "temp1_input")
         if raw.isdigit():
-            return round(int(raw) / 1000.0, 1)
+            temp_c = round(int(raw) / 1000.0, 1)
+            if 5.0 <= temp_c <= 130.0:
+                return temp_c
         return None
 
     def get_max_sustained_tdp_watts(self) -> int:
@@ -598,7 +723,6 @@ class LinuxHardwareBackend:
             watts_val, gpu_mhz, boost_flag = validate_overclock_args(watts, gpu_max_mhz, cpu_boost)
         except ValueError:
             return False
-        self.session.run_user_cmd(["steamosctl", "set-tdp-limit", str(min(watts_val, 15))])
         if os.geteuid() == 0:
             return apply_runtime_overclock_sysfs(watts_val, gpu_mhz, boost_flag)
         if HELPER_PATH.exists():
@@ -629,7 +753,12 @@ class LinuxHardwareBackend:
         return sys_ok or rc_tdp == 0
 
     def set_charge_limit(self, percent: int) -> bool:
-        rc, _ = self.session.run_user_cmd(["steamosctl", "set-max-charge-level", str(int(percent))])
+        val = int(percent)
+        if val < 0:
+            rc, _ = self.session.run_user_cmd(["steamosctl", "set-max-charge-level", "--", str(val)])
+            if rc == 0:
+                return True
+        rc, _ = self.session.run_user_cmd(["steamosctl", "set-max-charge-level", str(val)])
         return rc == 0
 
     def get_charge_limit(self) -> int:
@@ -747,11 +876,16 @@ class LinuxHardwareBackend:
         rc, _ = self.session.run_user_cmd(["steamosctl", "set-hdmi-cec-state", "control-and-wake"])
         if shutil.which("cec-ctl"):
             _run_cmd(["cec-ctl", "--to", "0", "--image-view-on"])
-            _run_cmd(["cec-ctl", "--to", "0", "--active-source", "phys-addr=1.0.0.0"])
+            rc_pa, pa_out = _run_cmd(["cec-ctl", "-s"])
+            if rc_pa == 0:
+                m_pa = re.search(r"Physical Address\s*:\s*([0-9a-fA-F.]+)", pa_out)
+                if m_pa and m_pa.group(1).lower() != "f.f.f.f":
+                    _run_cmd(["cec-ctl", "--to", "0", "--active-source", f"phys-addr={m_pa.group(1)}"])
         return rc == 0
 
     def pause_game_process(self, pid: int) -> bool:
-        ok, starttime = validate_game_pid(pid)
+        expected_uid = self.session.uid if self.session.uid > 0 else None
+        ok, starttime = validate_game_pid(pid, expected_uid=expected_uid)
         if not ok or starttime is None:
             return False
         try:
@@ -762,14 +896,20 @@ class LinuxHardwareBackend:
         return True
 
     def resume_game_process(self, pid: int) -> bool:
-        expected = self._paused_starttimes.pop(pid, None)
+        expected = self._paused_starttimes.get(pid)
         if expected is None:
             return False
-        ok, current = validate_game_pid(pid)
-        if not ok or current is None or current != expected:
+        current = capture_process_starttime(pid)
+        if current is None or current != expected:
+            if current is not None:
+                self._paused_starttimes.pop(pid, None)
             return False
         try:
             os.kill(pid, signal.SIGCONT)
+            self._paused_starttimes.pop(pid, None)
             return True
+        except ProcessLookupError:
+            self._paused_starttimes.pop(pid, None)
+            return False
         except OSError:
             return False

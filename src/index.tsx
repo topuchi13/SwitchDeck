@@ -5,7 +5,12 @@ import {
   removeEventListener,
   toaster,
 } from "@decky/api";
-import { isChimeAndToastEnabled, playSwitchClickClack } from "./ui/audioChime";
+import { Router } from "@decky/ui";
+import {
+  disposeAudioChime,
+  isChimeAndToastEnabled,
+  playSwitchClickClack,
+} from "./ui/audioChime";
 import { QuickAccessPanel } from "./ui/QuickAccessPanel";
 import { SwitchJoyConIcon, SwitchToastCard } from "./ui/SwitchToast";
 import type {
@@ -41,26 +46,33 @@ const pairSamsungTvRpc = callable<[string, number, string, boolean], PairSamsung
 const pairTvRpc = callable<[string, string, number, string, string, string, boolean], PairTvResult>(
   "pair_tv",
 );
-const testTvWakeRpc = callable<[], { ok: boolean }>("test_tv_wake");
+const testTvWakeRpc = callable<[], { ok: boolean; error?: string; cert_mismatch?: boolean }>(
+  "test_tv_wake",
+);
 
 async function applyNativeAppResolution(
   width: number,
   height: number,
   docked: boolean,
+  fallbackAppId?: number | null,
 ): Promise<boolean> {
   try {
     const win = window as unknown as {
       SteamClient?: SteamClientGlobal;
-      Router?: { MainRunningApp?: { appid?: number } };
+      Router?: { MainRunningApp?: { appid?: number | string } };
     };
     const apps = win.SteamClient?.Apps;
     if (!apps || typeof apps.SetAppResolutionOverride !== "function") {
       return false;
     }
+    const rawRouterAppId = Router?.MainRunningApp?.appid ?? win.Router?.MainRunningApp?.appid;
+    const routerAppId =
+      rawRouterAppId != null ? Number.parseInt(String(rawRouterAppId), 10) : NaN;
     const appId =
-      win.Router?.MainRunningApp?.appid ??
+      (Number.isFinite(routerAppId) && routerAppId > 0 ? routerAppId : undefined) ??
       apps.GetActiveAppID?.() ??
-      win.SteamClient?.UI?.GetFocusedWindowAppID?.();
+      win.SteamClient?.UI?.GetFocusedWindowAppID?.() ??
+      (fallbackAppId && fallbackAppId > 0 ? fallbackAppId : undefined);
     if (!appId || appId <= 0) {
       return false;
     }
@@ -97,7 +109,13 @@ const transport: SwitchDeckTransport = {
 
 export default definePlugin(() => {
   const handleTransition = (payload: TransitionPayload) => {
-    if (!payload || !isChimeAndToastEnabled()) {
+    if (!payload) {
+      return;
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("switchdeck:transition", { detail: payload }));
+    }
+    if (!isChimeAndToastEnabled()) {
       return;
     }
     playSwitchClickClack(payload.kind);
@@ -128,6 +146,7 @@ export default definePlugin(() => {
     icon: <SwitchJoyConIcon size={18} />,
     onDismount() {
       removeEventListener("switchdeck_transition", listener);
+      disposeAudioChime();
     },
   };
 });

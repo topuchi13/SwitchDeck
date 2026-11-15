@@ -5,7 +5,7 @@ set -euo pipefail
 # plus minimal root sysfs helper preserved across SteamOS atomic updates.
 
 DECK_USER="${SUDO_USER:-${USER:-deck}}"
-if [[ ! "$DECK_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+if [[ ! "$DECK_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
     echo "[SwitchDeck] Error: invalid username '$DECK_USER'" >&2
     exit 1
 fi
@@ -21,27 +21,39 @@ APP_DIR="${DECK_HOME}/.local/share/switchdeck"
 BIN_DIR="${DECK_HOME}/.local/bin"
 SYSTEMD_USER_DIR="${DECK_HOME}/.config/systemd/user"
 
-echo "[SwitchDeck] Installing for user '${DECK_USER}' into ${APP_DIR}..."
-mkdir -p "${APP_DIR}/src" "$BIN_DIR" "$SYSTEMD_USER_DIR"
-rm -rf "${APP_DIR}/src/switchdeck"
-cp -r "${REPO_DIR}/src/switchdeck" "${APP_DIR}/src/"
-cp "${REPO_DIR}/pyproject.toml" "$APP_DIR/"
-find "${APP_DIR}/src/switchdeck" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+run_as_deck_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -u "$DECK_USER" -H "$@"
+        else
+            su -s /bin/bash "$DECK_USER" -c "$(printf '%q ' "$@")"
+        fi
+    else
+        "$@"
+    fi
+}
 
-cat > "${BIN_DIR}/switchdeckd" <<EOF
+echo "[SwitchDeck] Installing for user '${DECK_USER}' into ${APP_DIR}..."
+run_as_deck_user mkdir -p "${APP_DIR}/src" "$BIN_DIR" "$SYSTEMD_USER_DIR"
+run_as_deck_user rm -rf "${APP_DIR}/src/switchdeck"
+run_as_deck_user cp -r "${REPO_DIR}/src/switchdeck" "${APP_DIR}/src/"
+run_as_deck_user cp "${REPO_DIR}/pyproject.toml" "$APP_DIR/"
+run_as_deck_user find "${APP_DIR}/src/switchdeck" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+run_as_deck_user tee "${BIN_DIR}/switchdeckd" >/dev/null <<EOF
 #!/usr/bin/env bash
 export PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\$PYTHONPATH}"
 exec /usr/bin/python3 -m switchdeck.daemon "\$@"
 EOF
 
-cat > "${BIN_DIR}/switchdeckctl" <<EOF
+run_as_deck_user tee "${BIN_DIR}/switchdeckctl" >/dev/null <<EOF
 #!/usr/bin/env bash
 export PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\$PYTHONPATH}"
 exec /usr/bin/python3 -m switchdeck.cli "\$@"
 EOF
-chmod +x "${BIN_DIR}/switchdeckd" "${BIN_DIR}/switchdeckctl"
+run_as_deck_user chmod +x "${BIN_DIR}/switchdeckd" "${BIN_DIR}/switchdeckctl"
 
-cat > "${SYSTEMD_USER_DIR}/switchdeckd.service" <<EOF
+run_as_deck_user tee "${SYSTEMD_USER_DIR}/switchdeckd.service" >/dev/null <<EOF
 [Unit]
 Description=SwitchDeck Universal Docking Daemon
 After=graphical-session.target pipewire.service wireplumber.service
@@ -62,7 +74,7 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO_PREFIX="sudo"
 fi
 
-$SUDO_PREFIX install -m 0755 "${REPO_DIR}/scripts/switchdeck-helper" /usr/local/bin/switchdeck-helper
+$SUDO_PREFIX install -o 0 -g 0 -m 0755 "${REPO_DIR}/scripts/switchdeck-helper" /usr/local/bin/switchdeck-helper
 
 SUDOERS_TMP="$(mktemp)"
 cleanup_sudoers_tmp() {
@@ -70,7 +82,10 @@ cleanup_sudoers_tmp() {
 }
 trap cleanup_sudoers_tmp EXIT
 
-printf '%s ALL=(root) NOPASSWD: /usr/local/bin/switchdeck-helper\n' "$DECK_USER" > "$SUDOERS_TMP"
+cat > "$SUDOERS_TMP" <<EOF
+Defaults!/usr/local/bin/switchdeck-helper env_reset, always_set_home, !setenv, secure_path="/usr/sbin:/usr/bin:/sbin:/bin"
+${DECK_USER} ALL=(root) NOPASSWD: /usr/local/bin/switchdeck-helper *
+EOF
 chmod 0440 "$SUDOERS_TMP"
 
 VISUDO_BIN="$(command -v visudo || command -v /usr/sbin/visudo || command -v /sbin/visudo || true)"
@@ -83,19 +98,13 @@ else
     exit 1
 fi
 
-$SUDO_PREFIX install -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/switchdeck
-$SUDO_PREFIX chown 0:0 /etc/sudoers.d/switchdeck
+$SUDO_PREFIX install -o 0 -g 0 -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/switchdeck
 
 $SUDO_PREFIX mkdir -p /etc/atomic-update.conf.d
 cat <<'EOF' | $SUDO_PREFIX tee /etc/atomic-update.conf.d/switchdeck.conf >/dev/null
 /usr/local/bin/switchdeck-helper
 /etc/sudoers.d/switchdeck
 EOF
-
-if [ "$(id -u)" -eq 0 ]; then
-    chown "${DECK_UID}:${DECK_GID}" "${DECK_HOME}/.local" "${DECK_HOME}/.local/share" "${DECK_HOME}/.config" 2>/dev/null || true
-    chown -R "${DECK_UID}:${DECK_GID}" "$APP_DIR" "$BIN_DIR" "${DECK_HOME}/.config/systemd"
-fi
 
 if command -v systemctl >/dev/null 2>&1; then
     RUNTIME_DIR="/run/user/${DECK_UID}"

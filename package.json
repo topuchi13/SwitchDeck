@@ -1,6 +1,6 @@
 {
   "name": "switchdeck",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "SwitchDeck Decky Loader plugin UI and build tooling",
@@ -16,7 +16,7 @@
     "build": "rollup -c",
     "watch": "rollup -c -w",
     "preview": "rollup -c preview/rollup.preview.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.preview.json --noEmit"
   },
   "dependencies": {
     "@decky/api": "^1.1.3",

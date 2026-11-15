@@ -26,10 +26,11 @@ cp "$ROOT_DIR/main.py" "$STAGE_DIR/"
 cp -R "$ROOT_DIR/dist" "$STAGE_DIR/dist"
 cp -R "$ROOT_DIR/src/switchdeck" "$STAGE_DIR/py_modules/switchdeck"
 
+find "$STAGE_DIR/dist" -name "*.map" -type f -delete
 find "$STAGE_DIR/py_modules" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$STAGE_DIR/py_modules" -name "*.pyc" -type f -delete
 
-rm -f "$ZIP_PATH" "$ZIP_DIR/SwitchDeck.zip"
+rm -f "$ZIP_DIR"/SwitchDeck-v*.zip "$ZIP_DIR/SwitchDeck.zip"
 (
   cd "$STAGE_ROOT"
   zip -qr "$ZIP_PATH" "SwitchDeck"

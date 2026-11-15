@@ -36,9 +36,9 @@ npm run typecheck && npm run build && npm run preview && ./scripts/build_decky_z
 
 ### Option A — Decky Loader Plugin ZIP (Recommended for Game Mode)
 
-1. Use the direct release URL `https://github.com/topuchi13/SwitchDeck/releases/latest/download/SwitchDeck.zip`, or build `dist-zip/SwitchDeck-v0.4.0.zip` locally via `./scripts/build_decky_zip.sh`.
+1. Use the direct release URL `https://github.com/topuchi13/SwitchDeck/releases/latest/download/SwitchDeck.zip`, or build `dist-zip/SwitchDeck-v0.4.1.zip` locally via `./scripts/build_decky_zip.sh`.
 2. On your Steam Deck in **Game Mode**, open **Settings -> System -> Enable Developer Mode**.
-3. Open **Settings -> Developer -> Install Plugin from URL** and paste the release URL above, or choose **Install Plugin from ZIP** and select `SwitchDeck-v0.4.0.zip`.
+3. Open **Settings -> Developer -> Install Plugin from URL** and paste the release URL above, or choose **Install Plugin from ZIP** and select `SwitchDeck-v0.4.1.zip`.
 4. Open the **Quick Access Menu (`•••`) -> Decky -> SwitchDeck**.
 
 The packaged plugin (`plugin.json` with `"flags": ["root"]`, `main.py`, `dist/index.js`, and `py_modules/switchdeck/`) runs an in-process `AF_NETLINK` uevent listener + 1.5s observer loop directly inside Decky Loader, resolves the `deck` user session for PipeWire/Gamescope/`steamosctl`, stores profiles/tokens in `DECKY_PLUGIN_SETTINGS_DIR` (`0600`), and unconditionally rebinds `28de:1205` in `_unload()` / `_uninstall()`.

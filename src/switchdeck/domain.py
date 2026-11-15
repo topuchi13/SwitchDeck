@@ -109,6 +109,7 @@ class EdidInfo:
     native_width: int
     native_height: int
     fingerprint: str
+    native_refresh_hz: float = 60.0
 
     @property
     def profile_id(self) -> str:
@@ -361,7 +362,7 @@ _INT_CLAMPS: dict[str, tuple[int, int, int]] = {
     "preferred_container_width": (640, 3840, 1920),
     "preferred_container_height": (480, 2160, 1080),
     "fsr_sharpness": (0, 20, 2),
-    "docked_tdp_watts": (3, 30, 15),
+    "docked_tdp_watts": (3, STOCK_MAX_TDP_WATTS, 15),
     "handheld_tdp_watts": (3, 15, 11),
 }
 
@@ -445,6 +446,7 @@ class DaemonStatus:
     overclock_active: bool = False
     overclock_thermal_throttled: bool = False
     overclock_status_note: str | None = None
+    active_app_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

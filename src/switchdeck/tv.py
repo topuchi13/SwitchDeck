@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
+import ipaddress
 import json
 import logging
 import os
 import socket
 import ssl
 import struct
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -35,10 +38,67 @@ class _WsPayloadTooLarge(ConnectionError, ValueError):
     """Raised when an incoming WebSocket frame exceeds MAX_WS_PAYLOAD_BYTES."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP 3xx redirects so local TV requests cannot be bounced off-box."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "HTTP redirects are disabled for TV control requests",
+            headers,
+            None,
+        )
+
+
+_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
+
+
+def _open_http_no_redirect(req: urllib.request.Request, timeout: float) -> Any:
+    return _HTTP_OPENER.open(req, timeout=timeout)
+
+
+def _redact_url_for_log(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/..."
+    except ValueError:
+        pass
+    return "<redacted-url>"
+
+
+def _sleep_or_cancel(seconds: float, cancel_event: threading.Event | None) -> bool:
+    """Sleep up to `seconds`, returning True if cancelled."""
+    if cancel_event is not None and cancel_event.is_set():
+        return True
+    if seconds <= 0:
+        return False
+    if cancel_event is not None:
+        return cancel_event.wait(seconds)
+    time.sleep(seconds)
+    return False
+
+
 class TvDriver(Protocol):
     """Unified interface for waking a TV and switching HDMI inputs."""
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
         ...
 
 
@@ -88,10 +148,21 @@ def _ws_encode_pong_frame(payload: bytes = b"") -> bytes:
     return _ws_encode_frame(0xA, payload[:125])
 
 
-def _recv_exact(sock: socket.socket, count: int) -> bytes:
+def _recv_exact(
+    sock: socket.socket,
+    count: int,
+    deadline: float | None = None,
+) -> bytes:
     """Read exactly `count` bytes from a socket or return empty/partial on EOF."""
     buf = bytearray()
+    has_settimeout = hasattr(sock, "settimeout")
     while len(buf) < count:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WebSocket read deadline exceeded")
+            if has_settimeout:
+                sock.settimeout(remaining)
         chunk = sock.recv(count - len(buf))
         if not chunk:
             break
@@ -99,44 +170,85 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
     return bytes(buf)
 
 
-def _ws_read_text_frame(sock: socket.socket) -> str | None:
-    """Read a single RFC 6455 server text frame, replying to Ping control frames."""
-    for _ in range(32):
-        first_two = _recv_exact(sock, 2)
-        if len(first_two) < 2:
-            return None
-        opcode = first_two[0] & 0x0F
-        masked = bool(first_two[1] & 0x80)
-        length = first_two[1] & 0x7F
-        if length == 126:
-            ext = _recv_exact(sock, 2)
-            if len(ext) < 2:
+def _ws_read_text_frame(
+    sock: socket.socket,
+    timeout: float | None = None,
+) -> str | None:
+    """Read a single RFC 6455 server text message (including fragmented FIN=0 frames)."""
+    has_timeout = hasattr(sock, "gettimeout") and hasattr(sock, "settimeout")
+    orig_timeout = sock.gettimeout() if has_timeout else None
+    eff_timeout = orig_timeout if timeout is None else timeout
+    deadline = (
+        time.monotonic() + eff_timeout
+        if (eff_timeout is not None and eff_timeout > 0)
+        else None
+    )
+    fragments: list[bytes] = []
+    in_fragmented = False
+    total_payload = 0
+    try:
+        for _ in range(64):
+            first_two = _recv_exact(sock, 2, deadline=deadline)
+            if len(first_two) < 2:
                 return None
-            length = struct.unpack("!H", ext)[0]
-        elif length == 127:
-            ext = _recv_exact(sock, 8)
-            if len(ext) < 8:
+            fin = bool(first_two[0] & 0x80)
+            opcode = first_two[0] & 0x0F
+            masked = bool(first_two[1] & 0x80)
+            length = first_two[1] & 0x7F
+            if length == 126:
+                ext = _recv_exact(sock, 2, deadline=deadline)
+                if len(ext) < 2:
+                    return None
+                length = struct.unpack("!H", ext)[0]
+            elif length == 127:
+                ext = _recv_exact(sock, 8, deadline=deadline)
+                if len(ext) < 8:
+                    return None
+                length = struct.unpack("!Q", ext)[0]
+            if length > MAX_WS_PAYLOAD_BYTES or (total_payload + length) > MAX_WS_PAYLOAD_BYTES:
+                raise _WsPayloadTooLarge(
+                    f"WebSocket payload length {total_payload + length} exceeds {MAX_WS_PAYLOAD_BYTES} bytes"
+                )
+            mask_key = _recv_exact(sock, 4, deadline=deadline) if masked else b""
+            if masked and len(mask_key) < 4:
                 return None
-            length = struct.unpack("!Q", ext)[0]
-        if length > MAX_WS_PAYLOAD_BYTES:
-            raise _WsPayloadTooLarge(
-                f"WebSocket payload length {length} exceeds {MAX_WS_PAYLOAD_BYTES} bytes"
-            )
-        mask_key = _recv_exact(sock, 4) if masked else b""
-        if masked and len(mask_key) < 4:
-            return None
-        buf = _recv_exact(sock, length)
-        if len(buf) < length or opcode == 0x8:  # Incomplete or Close
-            return None
-        if masked:
-            buf = bytes(b ^ mask_key[i % 4] for i, b in enumerate(buf))
-        if opcode == 0x9:  # Ping -> reply Pong (0x8A masked) and read next frame
-            sock.sendall(_ws_encode_pong_frame(buf))
-            continue
-        if opcode == 0xA:  # Unsolicited Pong -> read next frame
-            continue
-        return buf.decode("utf-8", errors="replace")
-    raise ConnectionError("Too many consecutive WebSocket control frames")
+            buf = _recv_exact(sock, length, deadline=deadline)
+            if len(buf) < length or opcode == 0x8:  # Incomplete or Close
+                return None
+            if masked:
+                buf = bytes(b ^ mask_key[i % 4] for i, b in enumerate(buf))
+            if (opcode & 0x8) and not fin:
+                raise ConnectionError("Fragmented WebSocket control frame")
+            if opcode == 0x9:  # Ping -> reply Pong (0x8A masked) and read next frame
+                sock.sendall(_ws_encode_pong_frame(buf))
+                continue
+            if opcode == 0xA:  # Unsolicited Pong -> read next frame
+                continue
+            if opcode in (0x1, 0x2):
+                if in_fragmented:
+                    raise ConnectionError("Unexpected WebSocket data frame during fragmented message")
+                total_payload += length
+                if fin:
+                    return buf.decode("utf-8", errors="replace")
+                fragments.append(buf)
+                in_fragmented = True
+                continue
+            if opcode == 0x0:
+                if not in_fragmented:
+                    raise ConnectionError("Unexpected WebSocket continuation frame")
+                total_payload += length
+                fragments.append(buf)
+                if fin:
+                    return b"".join(fragments).decode("utf-8", errors="replace")
+                continue
+            raise ConnectionError(f"Unsupported WebSocket opcode: 0x{opcode:x}")
+        raise ConnectionError("Too many consecutive WebSocket frames")
+    finally:
+        if has_timeout:
+            try:
+                sock.settimeout(orig_timeout)
+            except OSError:
+                pass
 
 
 class CecTvDriver:
@@ -145,7 +257,13 @@ class CecTvDriver:
     def __init__(self, cec_trigger: Callable[[], bool]) -> None:
         self._cec_trigger = cec_trigger
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.auto_power_on and not config.auto_switch_input:
             return False
         return self._cec_trigger()
@@ -163,16 +281,17 @@ class _WsTlsClientMixin:
         if self._custom_ssl_context is not None:
             return self._custom_ssl_context
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
     def _verify_tofu_fingerprint(self, sock: socket.socket, host: str, trust_new_cert: bool) -> None:
         if not hasattr(sock, "getpeercert"):
-            return
+            raise ssl.SSLCertVerificationError(f"TLS socket for {host} cannot expose peer certificate")
         cert_der = sock.getpeercert(binary_form=True)
         if not cert_der:
-            return
+            raise ssl.SSLCertVerificationError(f"Empty peer certificate from TLS host {host}")
         fp = hashlib.sha256(cert_der).hexdigest().lower()
         pinned = self._get_cert_fingerprint(host).strip().lower() if self._get_cert_fingerprint else ""
         if pinned and not trust_new_cert:
@@ -183,6 +302,15 @@ class _WsTlsClientMixin:
                 )
         elif self._set_cert_fingerprint is not None and (not pinned or trust_new_cert):
             self._set_cert_fingerprint(host, fp)
+
+    def _assert_no_plaintext_downgrade(self, host: str, port: int, *, use_tls: bool, trust_new_cert: bool) -> None:
+        if use_tls or trust_new_cert:
+            return
+        pinned = self._get_cert_fingerprint(host).strip().lower() if self._get_cert_fingerprint else ""
+        if pinned:
+            raise ssl.SSLCertVerificationError(
+                f"Refusing plaintext WebSocket to {host}:{port} because a TLS fingerprint is pinned"
+            )
 
     def _open_ws_socket(
         self,
@@ -195,12 +323,23 @@ class _WsTlsClientMixin:
         timeout: float | None = None,
     ) -> socket.socket:
         effective_timeout = self._timeout if timeout is None else timeout
+        deadline = (
+            time.monotonic() + effective_timeout
+            if (effective_timeout is not None and effective_timeout > 0)
+            else None
+        )
         raw_sock = socket.create_connection((host, port), timeout=effective_timeout)
         sock: socket.socket = raw_sock
         try:
             if use_tls:
                 ctx = self._build_ssl_context()
-                sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                server_hostname: str | None = host
+                try:
+                    ipaddress.ip_address(host.split("%", 1)[0])
+                    server_hostname = None
+                except ValueError:
+                    pass
+                sock = ctx.wrap_socket(raw_sock, server_hostname=server_hostname)
                 self._verify_tofu_fingerprint(sock, host, trust_new_cert=trust_new_cert)
 
             sock.settimeout(effective_timeout)
@@ -220,6 +359,11 @@ class _WsTlsClientMixin:
             # WebSocket greeting frame is never consumed into the handshake buffer.
             raw_response = bytearray()
             while b"\r\n\r\n" not in raw_response:
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        raise TimeoutError("WebSocket upgrade handshake deadline exceeded")
+                    sock.settimeout(rem)
                 if len(raw_response) >= MAX_WS_HANDSHAKE_BYTES:
                     raise ConnectionError("WebSocket upgrade response exceeded 16384 bytes")
                 chunk = sock.recv(1)
@@ -239,6 +383,7 @@ class _WsTlsClientMixin:
             ).decode("ascii")
             if expected_accept.encode("ascii") not in header_block:
                 raise ConnectionError("Invalid Sec-WebSocket-Accept header")
+            sock.settimeout(effective_timeout)
             return sock
         except Exception:
             try:
@@ -288,6 +433,9 @@ class SamsungTizenDriver(_WsTlsClientMixin):
             path += f"&token={urllib.parse.quote(str(token), safe='')}"
 
         use_tls = (port == 8002) or (self._custom_ssl_context is not None and port != 8001)
+        self._assert_no_plaintext_downgrade(
+            host, port, use_tls=use_tls, trust_new_cert=trust_new_cert
+        )
         return self._open_ws_socket(
             host=host,
             port=port,
@@ -337,7 +485,13 @@ class SamsungTizenDriver(_WsTlsClientMixin):
         """Initiate pairing (triggers on-TV Allow popup) and persist issued token."""
         return self.send_key(host, port, "KEY_HOME", trust_new_cert=trust_new_cert)
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.host:
             return False
         host = validate_host(config.host)
@@ -346,11 +500,15 @@ class SamsungTizenDriver(_WsTlsClientMixin):
             send_wake_on_lan(config.mac_address)
         try:
             if config.auto_power_on:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 self.send_key(host, port, "KEY_POWERON")
             if config.auto_switch_input:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 self.send_key(host, port, "KEY_HDMI")
             return True
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             LOG.warning("Samsung TV wake/switch failed for %s:%s: %s", host, port, exc)
             return False
 
@@ -398,6 +556,9 @@ class LgWebOsDriver(_WsTlsClientMixin):
     ) -> tuple[socket.socket, int]:
         requested_port = validate_port(port or 3001)
         use_tls = not (requested_port == 3000 and self._custom_ssl_context is None)
+        self._assert_no_plaintext_downgrade(
+            host, requested_port, use_tls=use_tls, trust_new_cert=trust_new_cert
+        )
         try:
             sock = self._open_ws_socket(
                 host=host,
@@ -542,7 +703,13 @@ class LgWebOsDriver(_WsTlsClientMixin):
         token, _ = self.pair_with_port(host, port=port, trust_new_cert=trust_new_cert)
         return token
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.host or (not config.auto_power_on and not config.auto_switch_input):
             return False
         host = validate_host(config.host)
@@ -555,6 +722,8 @@ class LgWebOsDriver(_WsTlsClientMixin):
         try:
             sock: socket.socket | None = None
             for attempt in range(attempts):
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 try:
                     sock, _ = self._connect_ssap(host, port, trust_new_cert=False)
                     break
@@ -563,15 +732,17 @@ class LgWebOsDriver(_WsTlsClientMixin):
                 except OSError:
                     if attempt + 1 >= attempts:
                         raise
-                    if self._wol_retry_delay > 0:
-                        time.sleep(self._wol_retry_delay)
+                    if _sleep_or_cancel(self._wol_retry_delay, cancel_event):
+                        return False
 
             assert sock is not None
             with sock:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 self._register_ssap(sock, host, wait_for_prompt=False)
-                if config.auto_power_on:
+                if config.auto_power_on and not (cancel_event is not None and cancel_event.is_set()):
                     self._send_ssap_request(sock, "screen_on_1", "ssap://system/turnOnScreen", {})
-                if config.auto_switch_input:
+                if config.auto_switch_input and not (cancel_event is not None and cancel_event.is_set()):
                     input_id, app_id = self._map_hdmi_targets(config.hdmi_input or "HDMI2")
                     switched = False
                     if input_id is not None:
@@ -655,7 +826,7 @@ class SonyBraviaDriver:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _open_http_no_redirect(req, timeout=self._timeout) as resp:
                 raw = resp.read(MAX_WS_PAYLOAD_BYTES)
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
@@ -663,6 +834,8 @@ class SonyBraviaDriver:
                     f"Sony Bravia rejected Pre-Shared Key (HTTP {exc.code})"
                 ) from exc
             raise
+        except http.client.HTTPException as exc:
+            raise ConnectionError(f"Sony Bravia HTTP protocol error: {exc}") from exc
         data = json.loads(raw.decode("utf-8")) if raw else {}
         if isinstance(data, dict) and data.get("error"):
             raise ConnectionError(f"Sony Bravia RPC error: {data['error']}")
@@ -681,7 +854,13 @@ class SonyBraviaDriver:
             self._set_psk(clean_host, effective_psk)
         return effective_psk
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.host or (not config.auto_power_on and not config.auto_switch_input):
             return False
         host = validate_host(config.host)
@@ -696,9 +875,13 @@ class SonyBraviaDriver:
         woke_tv = False
         try:
             if config.auto_power_on:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 self._rpc(host, port, psk, "system", "setPowerStatus", [{"status": True}])
                 woke_tv = True
             if config.auto_switch_input and config.hdmi_input:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
                 hdmi = validate_hdmi_input(config.hdmi_input)
                 uri = ""
                 if hdmi.startswith("HDMI"):
@@ -710,14 +893,14 @@ class SonyBraviaDriver:
                         self._rpc(host, port, psk, "avContent", "setPlayContent", [{"uri": uri}])
                     except PermissionError:
                         raise
-                    except (OSError, urllib.error.URLError):
+                    except (OSError, urllib.error.URLError, http.client.HTTPException):
                         if not woke_tv:
                             raise
-                        if self._wake_delay > 0:
-                            time.sleep(self._wake_delay)
+                        if _sleep_or_cancel(self._wake_delay, cancel_event):
+                            return False
                         self._rpc(host, port, psk, "avContent", "setPlayContent", [{"uri": uri}])
             return True
-        except (OSError, urllib.error.URLError, ValueError) as exc:
+        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
             LOG.warning("Sony Bravia wake/switch failed for %s:%s: %s", host, port, exc)
             return False
 
@@ -725,7 +908,13 @@ class SonyBraviaDriver:
 class RokuEcpDriver:
     """Roku TV ECP HTTP controller (default :8060, optional Wake-on-LAN)."""
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.host:
             return False
         host = validate_host(config.host)
@@ -743,15 +932,17 @@ class RokuEcpDriver:
             return False
         ok = True
         for key in actions:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             req = urllib.request.Request(
                 f"http://{host_url}:{port}/keypress/{key}",
                 data=b"",
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=2.0):
-                    pass
-            except (urllib.error.URLError, OSError):
+                with _open_http_no_redirect(req, timeout=2.0) as resp:
+                    resp.read(MAX_WS_PAYLOAD_BYTES)
+            except (urllib.error.URLError, http.client.HTTPException, OSError):
                 ok = False
         return ok
 
@@ -759,7 +950,13 @@ class RokuEcpDriver:
 class WakeOnLanTvDriver:
     """Standalone UDP Wake-on-LAN controller for any Smart TV with WoL enabled."""
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.auto_power_on or not config.mac_address:
             return False
         broadcast = config.host.strip() or "255.255.255.255"
@@ -769,7 +966,13 @@ class WakeOnLanTvDriver:
 class WebhookTvDriver:
     """Generic Home Assistant / IR-blaster / custom HTTP webhook driver."""
 
-    def wake_and_switch(self, config: TvDriverConfig) -> bool:
+    def wake_and_switch(
+        self,
+        config: TvDriverConfig,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not config.webhook_url:
             return False
         url = validate_webhook_url(config.webhook_url)
@@ -789,9 +992,11 @@ class WebhookTvDriver:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=2.5):
+            with _open_http_no_redirect(req, timeout=2.5) as resp:
+                resp.read(MAX_WS_PAYLOAD_BYTES)
                 return True
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            LOG.warning("Webhook TV trigger failed for %s: %s", _redact_url_for_log(url), exc)
             return False
 
 

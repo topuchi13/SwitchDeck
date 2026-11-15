@@ -27,8 +27,17 @@ def _send_ipc(cmd: str, socket_path: Path) -> dict[str, Any] | None:
             sock.settimeout(2.5)
             sock.connect(str(socket_path))
             sock.sendall((json.dumps({"cmd": cmd}) + "\n").encode("utf-8"))
-            data = sock.recv(65536)
-            return json.loads(data.decode("utf-8"))
+            buf = bytearray()
+            max_bytes = 262144
+            while len(buf) < max_bytes:
+                chunk = sock.recv(min(65536, max_bytes - len(buf)))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if b"\n" in chunk:
+                    break
+            raw_line = bytes(buf).split(b"\n", 1)[0]
+            return json.loads(raw_line.decode("utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -36,7 +45,10 @@ def _send_ipc(cmd: str, socket_path: Path) -> dict[str, Any] | None:
 def _run_doctor() -> int:
     backend = LinuxHardwareBackend()
     coord = SwitchDeckCoordinator(backend)
-    status = coord.reconcile()
+    try:
+        status = coord.inspect_status()
+    finally:
+        backend.close()
     print(f"Deck Model        : {status.deck_model.value}")
     print(f"Docked            : {status.is_docked} (connector={status.active_connector}, ac={status.ac_online})")
     print(

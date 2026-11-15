@@ -85,6 +85,7 @@ export interface DaemonStatus {
   overclock_active?: boolean;
   overclock_thermal_throttled?: boolean;
   overclock_status_note?: string | null;
+  active_app_id?: number | null;
 }
 
 export interface TvDriverConfig {
@@ -165,10 +166,11 @@ export interface SwitchDeckTransport {
     trustNewCert?: boolean,
   ) => Promise<PairSamsungResult>;
   pairTv?: (params: PairTvParams) => Promise<PairTvResult>;
-  testTvWake: () => Promise<{ ok: boolean }>;
+  testTvWake: () => Promise<{ ok: boolean; error?: string; cert_mismatch?: boolean }>;
   applyNativeAppResolution?: (
     width: number,
     height: number,
     docked: boolean,
+    fallbackAppId?: number | null,
   ) => Promise<boolean>;
 }

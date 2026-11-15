@@ -1,6 +1,7 @@
 import {
   ButtonItem,
   DropdownItem,
+  Focusable,
   PanelSection,
   PanelSectionRow,
   SliderField,
@@ -116,7 +117,37 @@ const HDMI_INPUT_OPTIONS: DropdownOption[] = [
   { data: "HDMI3", label: "HDMI 3" },
   { data: "HDMI4", label: "HDMI 4" },
   { data: "AV1", label: "AV 1" },
+  { data: "Tuner", label: "Live TV / Tuner" },
 ];
+
+function parsePortDraft(raw: string, driver: TvDriverKind): number {
+  const fallback = DEFAULT_TV_PORTS[driver] ?? 8002;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function mergeProfilePatch(
+  base: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base, ...incoming };
+  if (base.overclock || incoming.overclock) {
+    out.overclock = {
+      ...((base.overclock as Record<string, unknown> | undefined) || {}),
+      ...((incoming.overclock as Record<string, unknown> | undefined) || {}),
+    };
+  }
+  if (base.tv || incoming.tv) {
+    out.tv = {
+      ...((base.tv as Record<string, unknown> | undefined) || {}),
+      ...((incoming.tv as Record<string, unknown> | undefined) || {}),
+    };
+  }
+  return out;
+}
 
 function formatDeckModelLabel(model: string): string {
   if (model === "Jupiter") return "Deck LCD";
@@ -197,11 +228,16 @@ const HeroStatusCard: FC<{
           <span style={qamStyles.pill(status.is_docked ? "orangeSolid" : "steel")}>
             {status.is_docked ? "Docked" : "Handheld"}
           </span>
-          <button
-            type="button"
+          <Focusable
+            role="button"
+            tabIndex={0}
             aria-label="Refresh SwitchDeck status"
-            disabled={busy}
-            onClick={onRefresh}
+            onActivate={() => {
+              if (!busy) onRefresh();
+            }}
+            onClick={() => {
+              if (!busy) onRefresh();
+            }}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -212,12 +248,13 @@ const HeroStatusCard: FC<{
               border: `1px solid ${COLORS.borderSubtle}`,
               background: COLORS.bgElevated,
               color: COLORS.textSecondary,
+              opacity: busy ? 0.55 : 1,
               cursor: busy ? "wait" : "pointer",
               padding: 0,
             }}
           >
             <FaSyncAlt size={10} />
-          </button>
+          </Focusable>
         </div>
       </div>
 
@@ -350,8 +387,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   const [profile, setProfile] = useState<DockProfile | null>(initialProfile ?? null);
   const [loading, setLoading] = useState<boolean>(!initialStatus);
   const [busy, setBusy] = useState<boolean>(false);
+  const [pairingBusy, setPairingBusy] = useState<boolean>(false);
   const [chimeEnabled, setChimeEnabled] = useState<boolean>(() => isChimeAndToastEnabled());
   const [feedback, setFeedback] = useState<FeedbackMessage | null>(null);
+  const [tvFeedback, setTvFeedback] = useState<FeedbackMessage | null>(null);
+  const [ocFeedback, setOcFeedback] = useState<FeedbackMessage | null>(null);
   const [certMismatch, setCertMismatch] = useState<boolean>(false);
 
   // Local drafts so sliders & text inputs stay fluid
@@ -361,11 +401,15 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     initialProfile?.handheld_tdp_watts ?? 11,
   );
   const [tvHostDraft, setTvHostDraft] = useState<string>(initialProfile?.tv.host ?? "");
+  const [tvPortDraft, setTvPortDraft] = useState<string>(
+    String(initialProfile?.tv.port ?? 8002),
+  );
   const [tvMacDraft, setTvMacDraft] = useState<string>(initialProfile?.tv.mac_address ?? "");
   const [tvPskDraft, setTvPskDraft] = useState<string>("");
   const [tvWebhookDraft, setTvWebhookDraft] = useState<string>(
     initialProfile?.tv.webhook_url ?? "",
   );
+  const [tvDirty, setTvDirty] = useState<boolean>(false);
   const [boostTdpDraft, setBoostTdpDraft] = useState<number>(
     initialProfile?.overclock?.boost_tdp_watts ?? 18,
   );
@@ -374,49 +418,95 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     return mhz >= 1600 ? mhz : 1600;
   });
 
+  const mountedRef = useRef<boolean>(true);
+  const tvDraftDirtyRef = useRef<boolean>(false);
+  const pendingSliderPatchRef = useRef<Record<string, unknown> | null>(null);
   const sliderDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scalingSectionRef = useRef<HTMLDivElement | null>(null);
   const tvSectionRef = useRef<HTMLDivElement | null>(null);
   const overclockSectionRef = useRef<HTMLDivElement | null>(null);
 
-  const syncProfileDrafts = useCallback((nextProf: DockProfile) => {
+  const markTvDraftDirty = () => {
+    tvDraftDirtyRef.current = true;
+    setTvDirty(true);
+  };
+
+  const syncProfileDrafts = useCallback((nextProf: DockProfile, forceTvDraft = false) => {
     setProfile(nextProf);
     setFsrDraft(nextProf.fsr_sharpness);
     setDockedTdpDraft(nextProf.docked_tdp_watts);
     setHandheldTdpDraft(nextProf.handheld_tdp_watts);
-    setTvHostDraft(nextProf.tv?.host ?? "");
-    setTvMacDraft(nextProf.tv?.mac_address ?? "");
-    setTvWebhookDraft(nextProf.tv?.webhook_url ?? "");
+    if (forceTvDraft || !tvDraftDirtyRef.current) {
+      setTvHostDraft(nextProf.tv?.host ?? "");
+      const fallbackPort = DEFAULT_TV_PORTS[nextProf.tv?.driver ?? "cec"] ?? 8002;
+      setTvPortDraft(String(nextProf.tv?.port ?? fallbackPort));
+      setTvMacDraft(nextProf.tv?.mac_address ?? "");
+      setTvWebhookDraft(nextProf.tv?.webhook_url ?? "");
+      if (forceTvDraft) {
+        tvDraftDirtyRef.current = false;
+        setTvDirty(false);
+      }
+    }
     setBoostTdpDraft(nextProf.overclock?.boost_tdp_watts ?? 18);
     const nextGpu = nextProf.overclock?.gpu_max_mhz ?? 0;
     setGpuMaxDraft(nextGpu >= 1600 ? nextGpu : 1600);
   }, []);
 
-  const refreshAll = useCallback(async () => {
-    setBusy(true);
-    try {
-      const [nextStatus, nextProfile] = await Promise.all([
-        transport.getStatus(),
-        transport.getActiveProfile(),
-      ]);
-      setStatus(nextStatus);
-      syncProfileDrafts(nextProfile);
-    } catch (err) {
-      setFeedback({
-        tone: "crimson",
-        text: `Failed refreshing status: ${err instanceof Error ? err.message : String(err)}`,
-      });
-    } finally {
-      setLoading(false);
-      setBusy(false);
-    }
-  }, [syncProfileDrafts, transport]);
+  const refreshAll = useCallback(
+    async (quiet = false) => {
+      if (!quiet && mountedRef.current) {
+        setBusy(true);
+      }
+      try {
+        const [nextStatus, nextProfile] = await Promise.all([
+          transport.getStatus(),
+          transport.getActiveProfile(),
+        ]);
+        if (!mountedRef.current) return;
+        setStatus(nextStatus);
+        syncProfileDrafts(nextProfile);
+      } catch (err) {
+        if (!quiet && mountedRef.current) {
+          setFeedback({
+            tone: "crimson",
+            text: `Failed refreshing status: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      } finally {
+        if (mountedRef.current) {
+          setLoading(false);
+          if (!quiet) {
+            setBusy(false);
+          }
+        }
+      }
+    },
+    [syncProfileDrafts, transport],
+  );
 
   useEffect(() => {
+    mountedRef.current = true;
     if (!initialStatus || !initialProfile) {
-      void refreshAll();
+      void refreshAll(false);
+    }
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const onTransition = () => {
+      void refreshAll(true);
+    };
+    if (!initialStatus && typeof window !== "undefined") {
+      pollTimer = setInterval(() => {
+        void refreshAll(true);
+      }, 2500);
+      window.addEventListener("switchdeck:transition", onTransition);
     }
     return () => {
+      mountedRef.current = false;
+      if (pollTimer) {
+        clearInterval(pollTimer);
+      }
+      if (!initialStatus && typeof window !== "undefined") {
+        window.removeEventListener("switchdeck:transition", onTransition);
+      }
       if (sliderDebounceRef.current) {
         clearTimeout(sliderDebounceRef.current);
       }
@@ -434,23 +524,46 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   }, [initialScrollSection]);
 
   const commitProfilePatch = useCallback(
-    async (patch: Record<string, unknown>, message?: string) => {
-      setBusy(true);
+    async (
+      patch: Record<string, unknown>,
+      message?: string,
+      options?: {
+        setGlobalBusy?: boolean;
+        target?: "global" | "tv" | "oc";
+        forceTvSync?: boolean;
+      },
+    ) => {
+      const shouldBusy = options?.setGlobalBusy ?? true;
+      const target = options?.target ?? "global";
+      const setTargetMsg = (msg: FeedbackMessage) => {
+        if (target === "tv") setTvFeedback(msg);
+        else if (target === "oc") setOcFeedback(msg);
+        else setFeedback(msg);
+      };
+      if (shouldBusy && mountedRef.current) {
+        setBusy(true);
+      }
       try {
         const updated = await transport.updateProfile(patch);
-        syncProfileDrafts(updated);
+        if (!mountedRef.current) return;
+        syncProfileDrafts(updated, Boolean(options?.forceTvSync));
         const refreshed = await transport.getStatus();
+        if (!mountedRef.current) return;
         setStatus(refreshed);
         if (message) {
-          setFeedback({ tone: "orange", text: message });
+          setTargetMsg({ tone: "orange", text: message });
         }
       } catch (err) {
-        setFeedback({
-          tone: "crimson",
-          text: err instanceof Error ? err.message : String(err),
-        });
+        if (mountedRef.current) {
+          setTargetMsg({
+            tone: "crimson",
+            text: err instanceof Error ? err.message : String(err),
+          });
+        }
       } finally {
-        setBusy(false);
+        if (shouldBusy && mountedRef.current) {
+          setBusy(false);
+        }
       }
     },
     [syncProfileDrafts, transport],
@@ -458,11 +571,19 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
   const scheduleSliderPatch = useCallback(
     (patch: Record<string, unknown>) => {
+      pendingSliderPatchRef.current = mergeProfilePatch(
+        pendingSliderPatchRef.current || {},
+        patch,
+      );
       if (sliderDebounceRef.current) {
         clearTimeout(sliderDebounceRef.current);
       }
       sliderDebounceRef.current = setTimeout(() => {
-        void commitProfilePatch(patch);
+        const toSend = pendingSliderPatchRef.current;
+        pendingSliderPatchRef.current = null;
+        if (toSend) {
+          void commitProfilePatch(toSend, undefined, { setGlobalBusy: false });
+        }
       }, 220);
     },
     [commitProfilePatch],
@@ -549,7 +670,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     const targetW = profile?.preferred_container_width ?? 1920;
     const targetH = profile?.preferred_container_height ?? 1080;
     const dockedNow = Boolean(status?.is_docked);
-    const applied = await transport.applyNativeAppResolution(targetW, targetH, dockedNow);
+    const applied = await transport.applyNativeAppResolution(
+      targetW,
+      targetH,
+      dockedNow,
+      status?.active_app_id,
+    );
+    if (!mountedRef.current) return;
     setFeedback(
       applied
         ? {
@@ -569,14 +696,24 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setBusy(true);
     try {
       const res = await transport.nudgeDisplay();
+      if (!mountedRef.current) return;
       setFeedback({
         tone: res.ok ? "sage" : "crimson",
         text: res.ok
           ? "Sent GAMESCOPE_DISPLAY_MODE_NUDGE to HDMI output"
           : "Display nudge returned false (no active Gamescope display)",
       });
+    } catch (err) {
+      if (mountedRef.current) {
+        setFeedback({
+          tone: "crimson",
+          text: err instanceof Error ? err.message : String(err),
+        });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
   };
 
@@ -584,15 +721,44 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setBusy(true);
     try {
       const next = await transport.rebindBuiltin();
+      if (!mountedRef.current) return;
       setStatus(next);
       setFeedback({
         tone: "sage",
         text: "Emergency rebind complete: Deck controls (28de:1205) restored",
       });
     } catch (err) {
-      setFeedback({ tone: "crimson", text: String(err) });
+      if (mountedRef.current) {
+        setFeedback({ tone: "crimson", text: String(err) });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
+    }
+  };
+
+  const handleSaveTvSettings = async () => {
+    if (!profile) return;
+    const driverKind: TvDriverKind = profile.tv.driver ?? "cec";
+    const tvPatch: Record<string, unknown> = {
+      driver: driverKind,
+      host: tvHostDraft.trim(),
+      port: parsePortDraft(tvPortDraft, driverKind),
+      mac_address: tvMacDraft.trim(),
+      hdmi_input: profile.tv.hdmi_input || "HDMI2",
+      webhook_url: tvWebhookDraft.trim(),
+    };
+    const cleanPsk = tvPskDraft.trim();
+    if (driverKind === "sony_bravia" && cleanPsk) {
+      tvPatch.psk = cleanPsk;
+    }
+    await commitProfilePatch({ tv: tvPatch }, "TV configuration saved", {
+      target: "tv",
+      forceTvSync: true,
+    });
+    if (mountedRef.current && driverKind === "sony_bravia" && cleanPsk) {
+      setTvPskDraft("");
     }
   };
 
@@ -600,19 +766,27 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     const driverKind: TvDriverKind = profile?.tv?.driver ?? "samsung_tizen";
     const cleanHost = tvHostDraft.trim();
     if (!cleanHost) {
-      setFeedback({ tone: "crimson", text: "Enter TV IP/Hostname before pairing" });
+      setTvFeedback({ tone: "crimson", text: "Enter TV IP/Hostname before pairing" });
       return;
     }
     const cleanPsk = tvPskDraft.trim();
     if (driverKind === "sony_bravia" && !cleanPsk && !profile?.tv_paired) {
-      setFeedback({ tone: "crimson", text: "Enter Sony TV Pre-Shared Key (PSK) before verifying" });
+      setTvFeedback({ tone: "crimson", text: "Enter Sony TV Pre-Shared Key (PSK) before verifying" });
       return;
     }
 
     setBusy(true);
+    setPairingBusy(true);
     setCertMismatch(false);
+    setTvFeedback({
+      tone: "orange",
+      text:
+        driverKind === "sony_bravia"
+          ? `Verifying Sony Bravia PSK on ${cleanHost}...`
+          : `Pairing with ${cleanHost} — accept the prompt on your TV...`,
+    });
     try {
-      const targetPort = profile?.tv?.port || DEFAULT_TV_PORTS[driverKind] || 8002;
+      const targetPort = parsePortDraft(tvPortDraft, driverKind);
       const cleanMac = tvMacDraft.trim();
       const hdmiInput = profile?.tv?.hdmi_input || "HDMI2";
       const res = transport.pairTv
@@ -627,15 +801,19 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
           })
         : await transport.pairSamsungTv(cleanHost, targetPort, cleanMac, trustNewCert);
 
+      if (!mountedRef.current) return;
       if (res.ok) {
         if (driverKind === "sony_bravia") {
           setTvPskDraft("");
         }
+        tvDraftDirtyRef.current = false;
+        setTvDirty(false);
         if (res.profile) {
-          syncProfileDrafts(res.profile);
+          syncProfileDrafts(res.profile, true);
         } else {
-          await refreshAll();
+          await refreshAll(true);
         }
+        if (!mountedRef.current) return;
         let msg: string;
         if (driverKind === "lg_webos") {
           msg = `LG webOS TV paired & client-key saved (${cleanHost})`;
@@ -646,18 +824,23 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
             ? `Samsung TV paired & TLS cert pinned (${cleanHost})`
             : `Connected to ${cleanHost} — accept Allow prompt on TV`;
         }
-        setFeedback({ tone: "sage", text: msg });
+        setTvFeedback({ tone: "sage", text: msg });
       } else {
         setCertMismatch(Boolean(res.cert_mismatch));
-        setFeedback({
+        setTvFeedback({
           tone: "crimson",
           text: res.error || "TV pairing failed",
         });
       }
     } catch (err) {
-      setFeedback({ tone: "crimson", text: String(err) });
+      if (mountedRef.current) {
+        setTvFeedback({ tone: "crimson", text: String(err) });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setPairingBusy(false);
+        setBusy(false);
+      }
     }
   };
 
@@ -665,32 +848,43 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     if (!profile) return;
     setBusy(true);
     try {
+      const driverKind: TvDriverKind = profile.tv.driver ?? "cec";
       const tvPatch: Record<string, unknown> = {
-        driver: profile.tv.driver,
+        driver: driverKind,
         host: tvHostDraft.trim(),
+        port: parsePortDraft(tvPortDraft, driverKind),
         mac_address: tvMacDraft.trim(),
         hdmi_input: profile.tv.hdmi_input || "HDMI2",
         webhook_url: tvWebhookDraft.trim(),
       };
-      if (profile.tv.driver === "sony_bravia" && tvPskDraft.trim()) {
+      if (driverKind === "sony_bravia" && tvPskDraft.trim()) {
         tvPatch.psk = tvPskDraft.trim();
       }
       const updated = await transport.updateProfile({ tv: tvPatch });
-      if (profile.tv.driver === "sony_bravia" && tvPskDraft.trim()) {
+      if (!mountedRef.current) return;
+      if (driverKind === "sony_bravia" && tvPskDraft.trim()) {
         setTvPskDraft("");
       }
-      syncProfileDrafts(updated);
+      syncProfileDrafts(updated, true);
       const res = await transport.testTvWake();
-      setFeedback({
+      if (!mountedRef.current) return;
+      if (res.cert_mismatch) {
+        setCertMismatch(true);
+      }
+      setTvFeedback({
         tone: res.ok ? "sage" : "crimson",
         text: res.ok
           ? "TV wake & input switch signal sent"
-          : "TV wake failed — check TV power/network/driver config",
+          : res.error || "TV wake failed — check TV power/network/driver config",
       });
     } catch (err) {
-      setFeedback({ tone: "crimson", text: String(err) });
+      if (mountedRef.current) {
+        setTvFeedback({ tone: "crimson", text: String(err) });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
   };
 
@@ -744,6 +938,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         },
       },
       `Applied preset: ${preset.label}`,
+      { target: "oc" },
     );
   };
 
@@ -875,7 +1070,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                   max={20}
                   step={1}
                   showValue
-                  disabled={busy}
                   onChange={(val) => {
                     setFsrDraft(val);
                     scheduleSliderPatch({ fsr_sharpness: val });
@@ -891,7 +1085,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                   step={1}
                   valueSuffix="W"
                   showValue
-                  disabled={busy}
                   onChange={(val) => {
                     setDockedTdpDraft(val);
                     scheduleSliderPatch({ docked_tdp_watts: val });
@@ -907,7 +1100,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                   step={1}
                   valueSuffix="W"
                   showValue
-                  disabled={busy}
                   onChange={(val) => {
                     setHandheldTdpDraft(val);
                     scheduleSliderPatch({ handheld_tdp_watts: val });
@@ -938,16 +1130,20 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                   disabled={busy}
                   onChange={(opt) => {
                     const nextDriver = String(opt.data || "none") as TvDriverKind;
+                    const defaultPort = DEFAULT_TV_PORTS[nextDriver] ?? 8002;
                     setCertMismatch(false);
+                    setTvFeedback(null);
                     setTvPskDraft("");
+                    setTvPortDraft(String(defaultPort));
                     void commitProfilePatch(
                       {
                         tv: {
                           driver: nextDriver,
-                          port: DEFAULT_TV_PORTS[nextDriver] ?? 8002,
+                          port: defaultPort,
                         },
                       },
                       `TV driver set to ${opt.label}`,
+                      { target: "tv", forceTvSync: true },
                     );
                   }}
                 />
@@ -958,15 +1154,32 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 activeDriver === "sony_bravia" ||
                 activeDriver === "roku_ecp" ||
                 activeDriver === "wol") && (
-                <PanelSectionRow>
-                  <TextField
-                    label={activeDriver === "wol" ? "Broadcast IP (Optional)" : "TV Host / IP"}
-                    placeholder={activeDriver === "wol" ? "255.255.255.255" : "192.168.1.50"}
-                    value={tvHostDraft}
-                    disabled={busy}
-                    onChange={(e) => setTvHostDraft(e.target.value)}
-                  />
-                </PanelSectionRow>
+                <>
+                  <PanelSectionRow>
+                    <TextField
+                      label={activeDriver === "wol" ? "Broadcast IP (Optional)" : "TV Host / IP"}
+                      placeholder={activeDriver === "wol" ? "255.255.255.255" : "192.168.1.50"}
+                      value={tvHostDraft}
+                      disabled={busy}
+                      onChange={(e) => {
+                        markTvDraftDirty();
+                        setTvHostDraft(e.target.value);
+                      }}
+                    />
+                  </PanelSectionRow>
+                  <PanelSectionRow>
+                    <TextField
+                      label="TV Port"
+                      placeholder={String(DEFAULT_TV_PORTS[activeDriver] ?? 8002)}
+                      value={tvPortDraft}
+                      disabled={busy}
+                      onChange={(e) => {
+                        markTvDraftDirty();
+                        setTvPortDraft(e.target.value);
+                      }}
+                    />
+                  </PanelSectionRow>
+                </>
               )}
 
               {(activeDriver === "samsung_tizen" ||
@@ -980,7 +1193,10 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     placeholder="AA:BB:CC:DD:EE:FF"
                     value={tvMacDraft}
                     disabled={busy}
-                    onChange={(e) => setTvMacDraft(e.target.value)}
+                    onChange={(e) => {
+                      markTvDraftDirty();
+                      setTvMacDraft(e.target.value);
+                    }}
                   />
                 </PanelSectionRow>
               )}
@@ -1000,6 +1216,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       void commitProfilePatch(
                         { tv: { hdmi_input: nextInput } },
                         `TV HDMI input set to ${opt.label}`,
+                        { target: "tv" },
                       );
                     }}
                   />
@@ -1010,6 +1227,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 <PanelSectionRow>
                   <TextField
                     label="Pre-Shared Key (PSK)"
+                    bIsPassword
                     placeholder={
                       profile.tv_paired
                         ? "Saved (enter new PSK to replace)"
@@ -1017,7 +1235,10 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     }
                     value={tvPskDraft}
                     disabled={busy}
-                    onChange={(e) => setTvPskDraft(e.target.value)}
+                    onChange={(e) => {
+                      markTvDraftDirty();
+                      setTvPskDraft(e.target.value);
+                    }}
                   />
                 </PanelSectionRow>
               )}
@@ -1128,17 +1349,19 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 <PanelSectionRow>
                   <ButtonItem
                     layout="below"
-                    disabled={busy}
+                    disabled={busy || pairingBusy}
                     onClick={() => void handlePairTv(false)}
                   >
                     <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
                       <FaWifi size={11} color={COLORS.accent} />
                       <span>
-                        {activeDriver === "lg_webos"
-                          ? "Pair LG webOS TV"
-                          : activeDriver === "sony_bravia"
-                            ? "Save & Verify Sony PSK"
-                            : "Pair Samsung TV"}
+                        {pairingBusy
+                          ? "Pairing — Accept Prompt on TV..."
+                          : activeDriver === "lg_webos"
+                            ? "Pair LG webOS TV"
+                            : activeDriver === "sony_bravia"
+                              ? "Save & Verify Sony PSK"
+                              : "Pair Samsung TV"}
                       </span>
                     </span>
                   </ButtonItem>
@@ -1152,16 +1375,39 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     placeholder="http://homeassistant.local:8123/api/webhook/switchdeck"
                     value={tvWebhookDraft}
                     disabled={busy}
-                    onChange={(e) => setTvWebhookDraft(e.target.value)}
+                    onChange={(e) => {
+                      markTvDraftDirty();
+                      setTvWebhookDraft(e.target.value);
+                    }}
                   />
+                </PanelSectionRow>
+              )}
+
+              {(tvDirty || Boolean(tvPskDraft.trim())) && activeDriver !== "none" && activeDriver !== "cec" && (
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    disabled={busy || pairingBusy}
+                    onClick={() => void handleSaveTvSettings()}
+                  >
+                    Save TV Settings
+                  </ButtonItem>
                 </PanelSectionRow>
               )}
 
               {activeDriver !== "none" && (
                 <PanelSectionRow>
-                  <ButtonItem layout="below" disabled={busy} onClick={() => void handleTestTvWake()}>
+                  <ButtonItem layout="below" disabled={busy || pairingBusy} onClick={() => void handleTestTvWake()}>
                     Test TV Wake
                   </ButtonItem>
+                </PanelSectionRow>
+              )}
+
+              {tvFeedback && (
+                <PanelSectionRow>
+                  <div style={qamStyles.inlineFeedback(tvFeedback.tone)} role="status">
+                    {tvFeedback.text}
+                  </div>
                 </PanelSectionRow>
               )}
             </PanelSection>
@@ -1212,6 +1458,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                         void commitProfilePatch(
                           { overclock: { risk_acknowledged: true } },
                           "Experimental docked overclock unlocked (disabled until toggled on)",
+                          { target: "oc" },
                         )
                       }
                     >
@@ -1221,6 +1468,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       </span>
                     </ButtonItem>
                   </PanelSectionRow>
+                  {ocFeedback && (
+                    <PanelSectionRow>
+                      <div style={qamStyles.inlineFeedback(ocFeedback.tone)} role="status">
+                        {ocFeedback.text}
+                      </div>
+                    </PanelSectionRow>
+                  )}
                 </>
               ) : (
                 <>
@@ -1256,6 +1510,14 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     </div>
                   </PanelSectionRow>
 
+                  {ocFeedback && (
+                    <PanelSectionRow>
+                      <div style={qamStyles.inlineFeedback(ocFeedback.tone)} role="status">
+                        {ocFeedback.text}
+                      </div>
+                    </PanelSectionRow>
+                  )}
+
                   <PanelSectionRow>
                     <DropdownItem
                       label="Preset"
@@ -1282,6 +1544,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                                 : "Overclock armed (waiting for AC power)"
                               : "Overclock armed (applies when docked on AC)"
                             : "Overclock disabled — restored stock <= 15W",
+                          { target: "oc" },
                         )
                       }
                     />
@@ -1296,7 +1559,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       step={1}
                       valueSuffix="W"
                       showValue
-                      disabled={busy}
                       onChange={(val) => {
                         setBoostTdpDraft(val);
                         scheduleSliderPatch({ overclock: { boost_tdp_watts: val } });
@@ -1313,7 +1575,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       step={50}
                       valueSuffix=" MHz"
                       showValue
-                      disabled={busy}
                       onChange={(val) => {
                         setGpuMaxDraft(val);
                         scheduleSliderPatch({
@@ -1335,6 +1596,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                           val
                             ? "Docked CPU turbo boost enabled"
                             : "Docked CPU turbo boost disabled for GPU power headroom",
+                          { target: "oc" },
                         )
                       }
                     />
@@ -1358,6 +1620,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                             },
                           },
                           "Overclock reset to stock 15W and controls locked",
+                          { target: "oc" },
                         );
                       }}
                     >

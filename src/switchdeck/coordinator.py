@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from .backends.protocol import HardwareBackend
@@ -21,17 +25,21 @@ from .domain import (
     ScalingDecision,
     THERMAL_THROTTLE_RECOVER_C,
     THERMAL_THROTTLE_TRIGGER_C,
+    TvDriverConfig,
 )
 from .edid import select_best_output_mode
 from .profiles import ProfileStore
 from .scaling import compute_universal_scaling
 from .security import (
+    atomic_write_json,
+    capture_process_starttime,
     validate_hdmi_input,
     validate_host,
     validate_mac_address,
     validate_port,
     validate_tv_secret,
 )
+from .session import resolve_user_session
 from .tv import (
     LgWebOsDriver,
     SamsungTizenDriver,
@@ -56,6 +64,9 @@ class SwitchDeckCoordinator:
         self.store = store or ProfileStore()
         self.hold_pause_on_undock = hold_pause_on_undock
         self._lock = threading.RLock()
+        self._tv_op_lock = threading.Lock()
+        self._closed = False
+        self._startup_recovered = False
 
         self.is_docked: bool | None = None
         self.active_edid_id: str | None = None
@@ -63,11 +74,22 @@ class SwitchDeckCoordinator:
         self.travel_charge_override: bool = False
         self.paused_pid: int | None = None
         self._paused_at: float | None = None
+        cfg_dir = getattr(self.store, "config_dir", None)
+        self._paused_pid_path: Path | None = (
+            Path(cfg_dir) / "paused_pid.json" if cfg_dir is not None else None
+        )
 
         self._consecutive_gpu_overload: int = 0
+        self._gpu_underload_streak: int = 0
+        self._adaptive_cap: tuple[int, int] | None = None
         self._last_scaling: ScalingDecision | None = None
         self._last_scaling_key: tuple[int, int, int, int, int, bool] | None = None
         self._keepalive_initialized: bool = False
+        self._routed_hdmi_edid: str | None = None
+
+        self._wake_epoch: int = 0
+        self._wake_cancel_event: threading.Event | None = None
+        self._wake_thread: threading.Thread | None = None
 
         self._transition_seq: int = 0
         self._last_transition: dict[str, Any] | None = None
@@ -76,6 +98,73 @@ class SwitchDeckCoordinator:
         self._overclock_active: bool = False
         self._thermal_throttled: bool = False
         self._last_overclock_spec: tuple[int, int, bool] | None = None
+
+    def _persist_paused_pid_locked(self, pid: int) -> None:
+        if self._paused_pid_path is None:
+            return
+        try:
+            session = resolve_user_session()
+            uid = session.uid if session.is_root_host and session.uid != 0 else None
+            gid = session.gid if session.is_root_host and session.uid != 0 else None
+            atomic_write_json(
+                self._paused_pid_path,
+                {"pid": int(pid), "starttime": capture_process_starttime(pid)},
+                mode=0o600,
+                uid=uid,
+                gid=gid,
+            )
+        except OSError:
+            pass
+
+    def _clear_paused_pid_file_locked(self) -> None:
+        if self._paused_pid_path is None:
+            return
+        try:
+            self._paused_pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _run_startup_recovery_locked(self) -> None:
+        if self._startup_recovered:
+            return
+        self._startup_recovered = True
+        if self._paused_pid_path is None or not self._paused_pid_path.is_file():
+            return
+        try:
+            raw = json.loads(self._paused_pid_path.read_text(encoding="utf-8"))
+            pid = int(raw.get("pid")) if isinstance(raw, dict) else 0
+            starttime = raw.get("starttime") if isinstance(raw, dict) else None
+            if pid > 1 and (starttime is None or capture_process_starttime(pid) == starttime):
+                LOG.warning("Resuming orphaned paused game pid=%s from previous run", pid)
+                self.backend.resume_game_process(pid)
+        except (OSError, ValueError, TypeError):
+            pass
+        finally:
+            self._clear_paused_pid_file_locked()
+
+    @staticmethod
+    def _call_driver_wake(
+        driver: Any,
+        tv_cfg: TvDriverConfig,
+        cancel_event: threading.Event,
+    ) -> bool:
+        try:
+            sig = inspect.signature(driver.wake_and_switch)
+            params = sig.parameters
+            accepts_cancel = "cancel_event" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            accepts_cancel = False
+        if accepts_cancel:
+            return bool(driver.wake_and_switch(tv_cfg, cancel_event=cancel_event))
+        return bool(driver.wake_and_switch(tv_cfg))
+
+    def _cancel_pending_tv_wake_locked(self) -> None:
+        self._wake_epoch += 1
+        if self._wake_cancel_event is not None:
+            self._wake_cancel_event.set()
+            self._wake_cancel_event = None
 
     def _pick_primary_connector(self, displays: list[DisplayConnector]) -> DisplayConnector | None:
         connected = [d for d in displays if d.connected]
@@ -95,40 +184,53 @@ class SwitchDeckCoordinator:
         audio = self.backend.get_audio_state()
         current_kind = audio.default_sink.kind if audio.default_sink else "other"
 
-        if self.is_docked is None or self.is_docked == docked_now:
+        if not docked_now:
+            self._routed_hdmi_edid = None
+            if self.is_docked is True:
+                handheld_prof = self.store.get_handheld_profile()
+                if current_kind == "hdmi":
+                    prev_prof = self.store.get_profile(prev_edid_id)
+                    prev_prof.docked_volume = audio.volume
+                    self.store.put_profile(prev_prof)
+                if current_kind != "bluetooth":
+                    speaker_sink = next((s for s in audio.sinks if s.kind == "speakers"), None)
+                    if speaker_sink is not None:
+                        self.backend.set_default_audio_sink(speaker_sink.sink_id)
+                        self.backend.set_sink_volume(handheld_prof.handheld_volume)
+                updated_audio = self.backend.get_audio_state()
+                return updated_audio.default_sink.description if updated_audio.default_sink else None
             return audio.default_sink.description if audio.default_sink else None
 
         handheld_prof = self.store.get_handheld_profile()
-        if docked_now:
-            # Save handheld speaker volume before moving to HDMI
-            if current_kind == "speakers":
-                handheld_prof.handheld_volume = audio.volume
-                self.store.put_profile(handheld_prof)
+        if self.is_docked is False and current_kind == "speakers":
+            handheld_prof.handheld_volume = audio.volume
+            self.store.put_profile(handheld_prof)
+        elif self.is_docked is True and prev_edid_id and prev_edid_id != new_edid_id and current_kind == "hdmi":
+            prev_prof = self.store.get_profile(prev_edid_id)
+            prev_prof.docked_volume = audio.volume
+            self.store.put_profile(prev_prof)
 
+        target_edid = new_edid_id or "default"
+        if self._routed_hdmi_edid != target_edid:
             dock_prof = self.store.get_profile(new_edid_id, display_name)
             # Switch parity: if wireless Bluetooth headphones are active, keep them!
-            if current_kind != "bluetooth":
+            if current_kind == "bluetooth":
+                self._routed_hdmi_edid = target_edid
+            else:
                 hdmi_sink = next((s for s in audio.sinks if s.kind == "hdmi"), None)
                 if hdmi_sink is not None:
                     self.backend.set_default_audio_sink(hdmi_sink.sink_id)
                     self.backend.set_sink_volume(dock_prof.docked_volume)
-        else:
-            # Save docked HDMI volume before moving back to built-in speakers
-            if current_kind == "hdmi":
-                prev_prof = self.store.get_profile(prev_edid_id)
-                prev_prof.docked_volume = audio.volume
-                self.store.put_profile(prev_prof)
+                    self._routed_hdmi_edid = target_edid
+                    updated_audio = self.backend.get_audio_state()
+                    return updated_audio.default_sink.description if updated_audio.default_sink else None
 
-            if current_kind != "bluetooth":
-                speaker_sink = next((s for s in audio.sinks if s.kind == "speakers"), None)
-                if speaker_sink is not None:
-                    self.backend.set_default_audio_sink(speaker_sink.sink_id)
-                    self.backend.set_sink_volume(handheld_prof.handheld_volume)
-
-        updated_audio = self.backend.get_audio_state()
-        return updated_audio.default_sink.description if updated_audio.default_sink else None
+        return audio.default_sink.description if audio.default_sink else None
 
     def _dispatch_tv_wake_async(self, prof: DockProfile) -> None:
+        self._cancel_pending_tv_wake_locked()
+        if self._closed:
+            return
         driver = create_tv_driver(
             prof.tv.driver,
             cec_trigger=self.backend.trigger_hdmi_cec_wake,
@@ -141,17 +243,31 @@ class SwitchDeckCoordinator:
         )
         if driver is None:
             return
+        cancel_ev = threading.Event()
+        self._wake_cancel_event = cancel_ev
+        epoch = self._wake_epoch
         tv_cfg = replace(prof.tv)
 
         def _tv_worker() -> None:
-            try:
-                driver.wake_and_switch(tv_cfg)
-            except Exception as exc:
-                LOG.warning("Background TV wake/switch failed: %s", exc)
-                with self._lock:
-                    self._last_error = f"TV wake failed: {exc}"
+            with self._tv_op_lock:
+                if cancel_ev.is_set() or self._closed or self._wake_epoch != epoch:
+                    return
+                try:
+                    ok = self._call_driver_wake(driver, tv_cfg, cancel_ev)
+                    if not ok and tv_cfg.driver != "cec" and not cancel_ev.is_set() and not self._closed:
+                        with self._lock:
+                            if self._wake_epoch == epoch:
+                                self._last_error = f"TV wake returned False ({tv_cfg.driver})"
+                except Exception as exc:
+                    LOG.warning("Background TV wake/switch failed: %s", exc)
+                    if not cancel_ev.is_set() and not self._closed:
+                        with self._lock:
+                            if self._wake_epoch == epoch:
+                                self._last_error = f"TV wake failed: {exc}"
 
-        threading.Thread(target=_tv_worker, name="switchdeck-tv-wake", daemon=True).start()
+        th = threading.Thread(target=_tv_worker, name="switchdeck-tv-wake", daemon=True)
+        self._wake_thread = th
+        th.start()
 
     def _apply_power_and_tv(
         self,
@@ -189,6 +305,7 @@ class SwitchDeckCoordinator:
         is_transition: bool,
         apu_temp_c: float | None,
         hw_max_tdp_watts: int,
+        is_cold_boot: bool = False,
     ) -> str | None:
         if docked_now:
             prof = self.store.get_profile(edid_id, display_name)
@@ -222,6 +339,9 @@ class SwitchDeckCoordinator:
                     else f">= {int(THERMAL_THROTTLE_TRIGGER_C)}°C"
                 )
                 note = f"Thermal step-down ({temp_label} >= 90°C): reverted to <= 15W stock"
+            elif apu_temp_c is None:
+                should_overclock = False
+                note = "Standby: APU thermal sensor unavailable (fail-closed <= 15W)"
             else:
                 should_overclock = True
         else:
@@ -264,7 +384,11 @@ class SwitchDeckCoordinator:
                     note = f"Active: {effective_watts}W PPT · {gpu_part}{cpu_part}"
         else:
             had_overclock = self._overclock_active
-            if had_overclock:
+            needs_cold_oc_cleanup = is_cold_boot and (
+                not hasattr(self.backend, "events_log")
+                or bool(getattr(self.backend, "overclock_applied", False))
+            )
+            if had_overclock or needs_cold_oc_cleanup:
                 fallback_tdp = (
                     min(prof.docked_tdp_watts, STOCK_MAX_TDP_WATTS)
                     if docked_now
@@ -296,20 +420,29 @@ class SwitchDeckCoordinator:
         edid_id: str | None,
         display_name: str,
         is_transition: bool,
-    ) -> ScalingDecision:
+    ) -> tuple[ScalingDecision, int | None]:
         prof = self.store.get_profile(edid_id, display_name) if docked_now else self.store.get_handheld_profile()
         game = self.backend.get_active_game_window()
+        active_app_id = game.app_id if (game is not None and game.app_id > 0) else None
 
-        if (
-            docked_now
-            and game is not None
-            and game.height >= 900
-            and game.gpu_busy_percent is not None
-            and game.gpu_busy_percent >= 97
-        ):
-            self._consecutive_gpu_overload += 1
-        else:
+        if (not docked_now) or is_transition or (not prof.adaptive_gpu_downscale) or (game is None):
+            self._adaptive_cap = None
             self._consecutive_gpu_overload = 0
+            self._gpu_underload_streak = 0
+        else:
+            busy = game.gpu_busy_percent
+            if busy is not None and game.height >= 900 and busy >= 97:
+                self._consecutive_gpu_overload += 1
+                self._gpu_underload_streak = 0
+            elif busy is not None and busy <= 72:
+                self._consecutive_gpu_overload = 0
+                self._gpu_underload_streak += 1
+                if self._gpu_underload_streak >= 6:
+                    self._adaptive_cap = None
+                    self._gpu_underload_streak = 0
+            else:
+                self._consecutive_gpu_overload = 0
+                self._gpu_underload_streak = 0
 
         decision = compute_universal_scaling(
             is_docked=docked_now,
@@ -318,7 +451,12 @@ class SwitchDeckCoordinator:
             profile=prof,
             consecutive_gpu_overload=self._consecutive_gpu_overload,
             vrr_capable=(conn.vrr_capable if conn else False),
+            current_adaptive_cap=self._adaptive_cap,
         )
+        if "Adaptive GPU step-down" in decision.reason:
+            self._adaptive_cap = (decision.target_width, decision.target_height)
+            self._consecutive_gpu_overload = 0
+
         key = (
             decision.target_width,
             decision.target_height,
@@ -332,7 +470,7 @@ class SwitchDeckCoordinator:
             self.backend.apply_gamescope_scaling(decision, server_idx=server_idx)
             self._last_scaling_key = key
         self._last_scaling = decision
-        return decision
+        return decision, active_app_id
 
     def _record_transition_if_needed(
         self,
@@ -376,6 +514,8 @@ class SwitchDeckCoordinator:
     def reconcile(self) -> DaemonStatus:
         """Observe hardware state and execute any required Switch-style transitions."""
         with self._lock:
+            self._run_startup_recovery_locked()
+
             if (
                 self.paused_pid is not None
                 and self._paused_at is not None
@@ -419,6 +559,7 @@ class SwitchDeckCoordinator:
 
             if prev_docked is True and not docked_now:
                 self.manual_keep_builtin = False
+                self._cancel_pending_tv_wake_locked()
 
             # Optional mid-game undock pause while inputs & display settle
             transient_pause_pid: int | None = None
@@ -428,6 +569,7 @@ class SwitchDeckCoordinator:
                 if handheld_prof.auto_pause_on_undock and active_game and active_game.pid:
                     if self.backend.pause_game_process(active_game.pid):
                         transient_pause_pid = active_game.pid
+                        self._persist_paused_pid_locked(active_game.pid)
                         if self.hold_pause_on_undock:
                             self.paused_pid = active_game.pid
                             self._paused_at = time.monotonic()
@@ -465,10 +607,11 @@ class SwitchDeckCoordinator:
                     is_transition=is_transition,
                     apu_temp_c=apu_temp_c,
                     hw_max_tdp_watts=hw_max_tdp_watts,
+                    is_cold_boot=(prev_docked is None),
                 )
 
                 # 5. Universal Gamescope resolution + FSR/PIXEL scaling
-                scaling_decision = self._apply_scaling(
+                scaling_decision, active_app_id = self._apply_scaling(
                     docked_now=docked_now,
                     conn=primary_conn,
                     best_mode=best_mode,
@@ -485,6 +628,7 @@ class SwitchDeckCoordinator:
                 # Resume transient pause automatically unless an interactive overlay holds it
                 if transient_pause_pid is not None and not self.hold_pause_on_undock:
                     self.backend.resume_game_process(transient_pause_pid)
+                    self._clear_paused_pid_file_locked()
 
             self.is_docked = docked_now
             self.active_edid_id = edid_id if docked_now else None
@@ -552,6 +696,87 @@ class SwitchDeckCoordinator:
                 overclock_active=self._overclock_active,
                 overclock_thermal_throttled=self._thermal_throttled,
                 overclock_status_note=overclock_note,
+                active_app_id=active_app_id,
+            )
+
+    def inspect_status(self) -> DaemonStatus:
+        """Read-only hardware inspection with zero mutations or profile disk writes."""
+        with self._lock:
+            deck_model = self.backend.get_deck_model()
+            ac_online = self.backend.is_ac_online()
+            displays = self.backend.get_external_displays()
+            primary_conn = self._pick_primary_connector(displays)
+            docked_now = primary_conn is not None
+            edid_id = (
+                primary_conn.edid.profile_id
+                if (primary_conn and primary_conn.edid)
+                else ("default" if docked_now else None)
+            )
+            best_mode = select_best_output_mode(primary_conn.modes) if primary_conn else None
+            all_controllers = self.backend.get_external_controllers()
+            active_ctrls = [c for c in all_controllers if c.is_actively_awake]
+            sleeping_ctrls = [c for c in all_controllers if not c.is_actively_awake]
+            audio = self.backend.get_audio_state()
+            audio_desc = audio.default_sink.description if audio.default_sink else None
+            apu_temp_c = self.backend.get_apu_temperature_c()
+            hw_max_tdp_watts = self.backend.get_max_sustained_tdp_watts()
+            builtin_bound = self.backend.is_builtin_controller_bound()
+            charge_limit = self.backend.get_charge_limit()
+            lcd_bt_wake = self.backend.get_lcd_bluetooth_wakeup()
+            unhandled = self.backend.get_unhandled_dongles()
+            game = self.backend.get_active_game_window()
+            active_app_id = game.app_id if (game is not None and game.app_id > 0) else None
+
+            store_profiles = getattr(self.store, "_profiles", {})
+            if docked_now and edid_id and (not isinstance(store_profiles, dict) or edid_id in store_profiles):
+                prof = self.store.get_profile(edid_id)
+            else:
+                prof = self.store.get_handheld_profile()
+
+            scaling_decision = compute_universal_scaling(
+                is_docked=docked_now,
+                output_mode=best_mode,
+                game=game,
+                profile=prof,
+                consecutive_gpu_overload=self._consecutive_gpu_overload,
+                vrr_capable=(primary_conn.vrr_capable if primary_conn else False),
+                current_adaptive_cap=self._adaptive_cap,
+            )
+            tdp_watts = (
+                self._last_overclock_spec[0]
+                if (docked_now and self._overclock_active and self._last_overclock_spec is not None)
+                else (prof.docked_tdp_watts if docked_now else prof.handheld_tdp_watts)
+            )
+
+            return DaemonStatus(
+                deck_model=deck_model,
+                is_docked=docked_now,
+                ac_online=ac_online,
+                active_connector=primary_conn.name if primary_conn else None,
+                active_edid_id=edid_id if docked_now else None,
+                selected_output_mode=best_mode,
+                builtin_controller_bound=builtin_bound,
+                active_controllers=active_ctrls,
+                sleeping_controllers=sleeping_ctrls,
+                unhandled_dongles=unhandled,
+                lcd_bluetooth_wakeup_enabled=lcd_bt_wake,
+                charge_limit=charge_limit,
+                tdp_watts=tdp_watts,
+                last_scaling=scaling_decision,
+                audio_sink=audio_desc,
+                manual_keep_builtin=self.manual_keep_builtin,
+                travel_charge_override=self.travel_charge_override,
+                transition_seq=self._transition_seq,
+                last_transition=(
+                    dict(self._last_transition) if self._last_transition is not None else None
+                ),
+                last_error=self._last_error,
+                apu_temp_c=apu_temp_c,
+                hw_max_tdp_watts=hw_max_tdp_watts,
+                overclock_active=self._overclock_active,
+                overclock_thermal_throttled=self._thermal_throttled,
+                overclock_status_note=None,
+                active_app_id=active_app_id,
             )
 
     def resume_paused_game(self) -> bool:
@@ -562,7 +787,9 @@ class SwitchDeckCoordinator:
             pid = self.paused_pid
             self.paused_pid = None
             self._paused_at = None
-            return self.backend.resume_game_process(pid)
+            resumed = self.backend.resume_game_process(pid)
+            self._clear_paused_pid_file_locked()
+            return resumed
 
     def set_travel_charge_100(self) -> DaemonStatus:
         """Temporarily allow 100% charging while docked before travel."""
@@ -611,7 +838,17 @@ class SwitchDeckCoordinator:
             current = self.get_active_profile()
             merged = current.to_dict()
             pending_psk: tuple[str, str] | None = None
+            reset_adaptive = False
+            patched_handheld_keys: set[str] = set()
             if isinstance(patch, dict):
+                if any(
+                    k in patch
+                    for k in ("preferred_container_width", "preferred_container_height", "adaptive_gpu_downscale")
+                ):
+                    reset_adaptive = True
+                for hk in ("handheld_tdp_watts", "handheld_volume", "auto_pause_on_undock"):
+                    if hk in patch:
+                        patched_handheld_keys.add(hk)
                 tv_patch = patch.get("tv")
                 if isinstance(tv_patch, dict):
                     tv_patch_clean = dict(tv_patch)
@@ -641,11 +878,24 @@ class SwitchDeckCoordinator:
                         merged[key] = val
             updated = DockProfile.from_dict(merged)
             self.store.put_profile(updated)
+            if updated.profile_id != "default" and patched_handheld_keys:
+                default_prof = self.store.get_profile("default")
+                if "handheld_tdp_watts" in patched_handheld_keys:
+                    default_prof.handheld_tdp_watts = updated.handheld_tdp_watts
+                if "handheld_volume" in patched_handheld_keys:
+                    default_prof.handheld_volume = updated.handheld_volume
+                if "auto_pause_on_undock" in patched_handheld_keys:
+                    default_prof.auto_pause_on_undock = updated.auto_pause_on_undock
+                self.store.put_profile(default_prof)
             if pending_psk is not None:
                 set_drv_tok = getattr(self.store, "set_driver_token", None)
                 if callable(set_drv_tok):
                     set_drv_tok("sony_bravia", pending_psk[0], pending_psk[1])
             self._last_scaling_key = None
+            if reset_adaptive:
+                self._adaptive_cap = None
+                self._gpu_underload_streak = 0
+                self._consecutive_gpu_overload = 0
             if self.is_docked is True:
                 if self.backend.is_ac_online() and not (
                     updated.overclock.risk_acknowledged and updated.overclock.enabled
@@ -694,28 +944,29 @@ class SwitchDeckCoordinator:
         trust_new_cert: bool = False,
     ) -> dict[str, Any]:
         """Pair or verify credentials for Samsung Tizen, LG webOS, or Sony Bravia TV."""
+        drv = (driver_name or "").strip().lower()
+        if drv not in ("samsung_tizen", "lg_webos", "sony_bravia"):
+            raise ValueError(f"Interactive pairing is not supported for TV driver {drv!r}")
+
+        clean_host = validate_host(str(host or "").strip())
+        default_port = DEFAULT_TV_PORTS.get(drv, 8002)
+        clean_port = validate_port(port if port else default_port)
+        clean_mac = validate_mac_address(str(mac or ""))
+        clean_hdmi = (
+            validate_hdmi_input(hdmi_input)
+            if (isinstance(hdmi_input, str) and hdmi_input.strip())
+            else ""
+        )
+        trust = bool(trust_new_cert)
+
         with self._lock:
-            drv = (driver_name or "").strip().lower()
-            if drv not in ("samsung_tizen", "lg_webos", "sony_bravia"):
-                raise ValueError(f"Interactive pairing is not supported for TV driver {drv!r}")
-
-            clean_host = validate_host(str(host or "").strip())
-            default_port = DEFAULT_TV_PORTS.get(drv, 8002)
-            clean_port = validate_port(port if port else default_port)
-            clean_mac = validate_mac_address(str(mac or ""))
-            clean_hdmi = (
-                validate_hdmi_input(hdmi_input)
-                if (isinstance(hdmi_input, str) and hdmi_input.strip())
-                else ""
-            )
-            trust = bool(trust_new_cert)
-
+            if self._closed:
+                raise ConnectionError("SwitchDeck coordinator is closed")
             get_fp = getattr(self.store, "get_cert_fingerprint", None)
             set_fp = getattr(self.store, "set_cert_fingerprint", None)
             clear_fp = getattr(self.store, "clear_cert_fingerprint", None)
             get_drv_tok = getattr(self.store, "get_driver_token", None)
             set_drv_tok = getattr(self.store, "set_driver_token", None)
-
             _get_tok = (
                 (lambda h: get_drv_tok(drv, h))
                 if callable(get_drv_tok)
@@ -727,6 +978,9 @@ class SwitchDeckCoordinator:
                 else self.store.set_token
             )
 
+        with self._tv_op_lock:
+            if self._closed:
+                raise ConnectionError("SwitchDeck coordinator is closed")
             if trust and drv in ("samsung_tizen", "lg_webos") and callable(clear_fp):
                 clear_fp(clean_host)
 
@@ -755,6 +1009,9 @@ class SwitchDeckCoordinator:
                 tv_drv_sony = SonyBraviaDriver(get_psk=_get_tok, set_psk=_set_tok)
                 token = tv_drv_sony.pair(clean_host, port=clean_port, psk=psk)
 
+        with self._lock:
+            if self._closed:
+                raise ConnectionError("SwitchDeck coordinator is closed")
             current_prof = self.get_active_profile()
             tv_patch: dict[str, Any] = {
                 "driver": drv,
@@ -787,6 +1044,8 @@ class SwitchDeckCoordinator:
     def test_active_tv_wake(self) -> bool:
         """Synchronously test waking/switching the active profile's TV."""
         with self._lock:
+            if self._closed:
+                return False
             prof = self.get_active_profile()
             tv_cfg = replace(prof.tv)
             driver = create_tv_driver(
@@ -800,20 +1059,33 @@ class SwitchDeckCoordinator:
                 set_driver_token=getattr(self.store, "set_driver_token", None),
             )
             if driver is None:
+                self._last_error = f"TV driver {tv_cfg.driver!r} disabled or unavailable"
+                return False
+
+        with self._tv_op_lock:
+            if self._closed:
                 return False
             try:
-                ok = driver.wake_and_switch(tv_cfg)
-                if ok:
-                    self._last_error = None
+                ok = bool(driver.wake_and_switch(tv_cfg))
+                with self._lock:
+                    if ok:
+                        self._last_error = None
+                    else:
+                        self._last_error = f"TV wake returned False ({tv_cfg.driver})"
                 return ok
             except Exception as exc:
-                self._last_error = str(exc)
+                with self._lock:
+                    self._last_error = str(exc)
                 LOG.warning("Active TV wake test failed: %s", exc)
                 return False
 
     def close(self) -> None:
         """Guaranteed crash/shutdown failsafe: never leave Deck buttons unbound."""
+        wake_thread: threading.Thread | None = None
         with self._lock:
+            self._closed = True
+            self._cancel_pending_tv_wake_locked()
+            wake_thread = self._wake_thread
             LOG.info("Running SwitchDeck shutdown failsafe: rebinding built-in controller.")
             try:
                 if self.paused_pid is not None:
@@ -832,3 +1104,5 @@ class SwitchDeckCoordinator:
                     getattr(self.backend, "close", lambda: None)()
                 except Exception:
                     LOG.exception("Error closing SwitchDeck hardware backend")
+        if wake_thread is not None and wake_thread.is_alive() and wake_thread is not threading.current_thread():
+            wake_thread.join(timeout=0.5)

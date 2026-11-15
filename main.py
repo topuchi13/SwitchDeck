@@ -109,7 +109,7 @@ class Plugin:
     async def _run_status_transition(
         self, op: Callable[[SwitchDeckCoordinator], DaemonStatus]
     ) -> DaemonStatus:
-        coord = self._ensure_coordinator()
+        coord = await asyncio.to_thread(self._ensure_coordinator)
         transition_to_emit: dict[str, Any] | None = None
         async with self._get_lock():
             status = await asyncio.to_thread(op, coord)
@@ -237,7 +237,7 @@ class Plugin:
 
     async def _main(self) -> None:
         _propagate_decky_env()
-        self._ensure_coordinator()
+        await asyncio.to_thread(self._ensure_coordinator)
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
         await self._safe_reconcile()
@@ -287,16 +287,24 @@ class Plugin:
         return status.to_dict()
 
     async def get_active_profile(self) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
-        async with self._get_lock():
-            prof = await asyncio.to_thread(coord.get_active_profile)
+        coord = await asyncio.to_thread(self._ensure_coordinator)
+
+        def _fetch() -> dict[str, Any]:
+            prof = coord.get_active_profile()
             return self._profile_payload(coord, prof)
 
-    async def update_profile(self, patch: dict[str, Any]) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
         async with self._get_lock():
-            prof = await asyncio.to_thread(coord.update_active_profile, patch or {})
+            return await asyncio.to_thread(_fetch)
+
+    async def update_profile(self, patch: dict[str, Any]) -> dict[str, Any]:
+        coord = await asyncio.to_thread(self._ensure_coordinator)
+
+        def _update() -> dict[str, Any]:
+            prof = coord.update_active_profile(patch or {})
             return self._profile_payload(coord, prof)
+
+        async with self._get_lock():
+            return await asyncio.to_thread(_update)
 
     async def set_keep_builtin(self, enabled: bool) -> dict[str, Any]:
         status = await self._run_status_transition(
@@ -315,7 +323,7 @@ class Plugin:
         return status.to_dict()
 
     async def nudge_display(self) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
+        coord = await asyncio.to_thread(self._ensure_coordinator)
         async with self._get_lock():
             nudged = await asyncio.to_thread(coord.backend.nudge_gamescope_display)
             return {"ok": bool(nudged)}
@@ -327,7 +335,7 @@ class Plugin:
         mac: str = "",
         trust_new_cert: bool = False,
     ) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
+        coord = await asyncio.to_thread(self._ensure_coordinator)
 
         def _do_pair() -> dict[str, Any]:
             clean_host = str(host or "").strip()
@@ -340,25 +348,32 @@ class Plugin:
             set_fp = getattr(store, "set_cert_fingerprint", None)
             clear_fp = getattr(store, "clear_cert_fingerprint", None)
 
-            if trust and callable(clear_fp) and clean_host:
-                clear_fp(clean_host)
+            tv_op_lock = getattr(coord, "_tv_op_lock", None)
+            if tv_op_lock is not None:
+                tv_op_lock.acquire()
+            try:
+                if trust and callable(clear_fp) and clean_host:
+                    clear_fp(clean_host)
 
-            driver_kwargs: dict[str, Any] = {
-                "get_token": store.get_token,
-                "set_token": store.set_token,
-            }
-            sig = inspect.signature(SamsungTizenDriver.__init__)
-            if "get_cert_fingerprint" in sig.parameters and callable(get_fp):
-                driver_kwargs["get_cert_fingerprint"] = get_fp
-            if "set_cert_fingerprint" in sig.parameters and callable(set_fp):
-                driver_kwargs["set_cert_fingerprint"] = set_fp
+                driver_kwargs: dict[str, Any] = {
+                    "get_token": store.get_token,
+                    "set_token": store.set_token,
+                }
+                sig = inspect.signature(SamsungTizenDriver.__init__)
+                if "get_cert_fingerprint" in sig.parameters and callable(get_fp):
+                    driver_kwargs["get_cert_fingerprint"] = get_fp
+                if "set_cert_fingerprint" in sig.parameters and callable(set_fp):
+                    driver_kwargs["set_cert_fingerprint"] = set_fp
 
-            driver = SamsungTizenDriver(**driver_kwargs)
-            pair_sig = inspect.signature(driver.pair)
-            if "trust_new_cert" in pair_sig.parameters:
-                token = driver.pair(clean_host, port=clean_port, trust_new_cert=trust)
-            else:
-                token = driver.pair(clean_host, port=clean_port)
+                driver = SamsungTizenDriver(**driver_kwargs)
+                pair_sig = inspect.signature(driver.pair)
+                if "trust_new_cert" in pair_sig.parameters:
+                    token = driver.pair(clean_host, port=clean_port, trust_new_cert=trust)
+                else:
+                    token = driver.pair(clean_host, port=clean_port)
+            finally:
+                if tv_op_lock is not None:
+                    tv_op_lock.release()
 
             current_prof = coord.get_active_profile()
             tv_patch: dict[str, Any] = {
@@ -382,21 +397,20 @@ class Plugin:
                 "profile": self._profile_payload(coord, updated_prof),
             }
 
-        async with self._get_lock():
-            try:
-                return await asyncio.to_thread(_do_pair)
-            except ssl.SSLCertVerificationError as exc:
-                return {
-                    "ok": False,
-                    "cert_mismatch": True,
-                    "error": str(exc),
-                }
-            except (ValueError, OSError, ConnectionError) as exc:
-                return {
-                    "ok": False,
-                    "cert_mismatch": False,
-                    "error": str(exc),
-                }
+        try:
+            return await asyncio.to_thread(_do_pair)
+        except ssl.SSLCertVerificationError as exc:
+            return {
+                "ok": False,
+                "cert_mismatch": True,
+                "error": str(exc),
+            }
+        except (ValueError, OSError, ConnectionError) as exc:
+            return {
+                "ok": False,
+                "cert_mismatch": False,
+                "error": str(exc),
+            }
 
     async def pair_tv(
         self,
@@ -408,34 +422,39 @@ class Plugin:
         psk: str = "",
         trust_new_cert: bool = False,
     ) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
-        async with self._get_lock():
-            try:
-                return await asyncio.to_thread(
-                    coord.pair_tv,
-                    driver,
-                    host,
-                    int(port or 0),
-                    str(mac or ""),
-                    str(hdmi_input or ""),
-                    str(psk or ""),
-                    bool(trust_new_cert),
-                )
-            except ssl.SSLCertVerificationError as exc:
-                return {
-                    "ok": False,
-                    "cert_mismatch": True,
-                    "error": str(exc),
-                }
-            except (ValueError, OSError, ConnectionError) as exc:
-                return {
-                    "ok": False,
-                    "cert_mismatch": False,
-                    "error": str(exc),
-                }
+        coord = await asyncio.to_thread(self._ensure_coordinator)
+        try:
+            return await asyncio.to_thread(
+                coord.pair_tv,
+                driver,
+                host,
+                int(port or 0),
+                str(mac or ""),
+                str(hdmi_input or ""),
+                str(psk or ""),
+                bool(trust_new_cert),
+            )
+        except ssl.SSLCertVerificationError as exc:
+            return {
+                "ok": False,
+                "cert_mismatch": True,
+                "error": str(exc),
+            }
+        except (ValueError, OSError, ConnectionError) as exc:
+            return {
+                "ok": False,
+                "cert_mismatch": False,
+                "error": str(exc),
+            }
 
     async def test_tv_wake(self) -> dict[str, Any]:
-        coord = self._ensure_coordinator()
-        async with self._get_lock():
-            ok = await asyncio.to_thread(coord.test_active_tv_wake)
-            return {"ok": bool(ok)}
+        coord = await asyncio.to_thread(self._ensure_coordinator)
+        ok = await asyncio.to_thread(coord.test_active_tv_wake)
+        if ok:
+            return {"ok": True}
+        err = getattr(coord, "_last_error", None) or "TV wake failed"
+        return {
+            "ok": False,
+            "cert_mismatch": "fingerprint mismatch" in str(err).lower(),
+            "error": str(err),
+        }

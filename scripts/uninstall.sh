@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DECK_USER="${SUDO_USER:-${USER:-deck}}"
-if [[ ! "$DECK_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+if [[ ! "$DECK_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
     echo "[SwitchDeck] Error: invalid username '$DECK_USER'" >&2
     exit 1
 fi
@@ -28,8 +28,14 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
 fi
 
-if [ -x "${DECK_HOME}/.local/bin/switchdeckctl" ]; then
-    HOME="$DECK_HOME" XDG_RUNTIME_DIR="$RUNTIME_DIR" "${DECK_HOME}/.local/bin/switchdeckctl" rebind-builtin || true
+SUDO_PREFIX=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO_PREFIX="sudo"
+fi
+
+if [ -x /usr/local/bin/switchdeck-helper ]; then
+    $SUDO_PREFIX /usr/local/bin/switchdeck-helper rebind-all-neptune 2>/dev/null || true
+    $SUDO_PREFIX /usr/local/bin/switchdeck-helper reset-overclock 15 2>/dev/null || true
 fi
 
 rm -f "${DECK_HOME}/.config/systemd/user/switchdeckd.service" \
@@ -38,11 +44,6 @@ rm -f "${DECK_HOME}/.config/systemd/user/switchdeckd.service" \
       "${DECK_HOME}/.config/wireplumber/wireplumber.conf.d/51-switchdeck-keepalive.conf"
 rm -rf "${DECK_HOME}/.local/share/switchdeck"
 
-SUDO_PREFIX=""
-if [ "$(id -u)" -ne 0 ]; then
-    SUDO_PREFIX="sudo"
-fi
-[ -x /usr/local/bin/switchdeck-helper ] && $SUDO_PREFIX /usr/local/bin/switchdeck-helper reset-overclock 15 2>/dev/null || true
 $SUDO_PREFIX rm -f /usr/local/bin/switchdeck-helper /etc/sudoers.d/switchdeck /etc/atomic-update.conf.d/switchdeck.conf || true
 
 echo "[SwitchDeck] Uninstalled cleanly."

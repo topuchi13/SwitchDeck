@@ -30,15 +30,29 @@ _PROTECTED_PROCESS_COMMS: frozenset[str] = frozenset(
     {
         "steam",
         "steamwebhelper",
+        "crbrowsermain",
+        "mainthrd",
         "gamescope",
         "gamescope-wl",
         "xwayland",
         "systemd",
+        "systemd-udevd",
+        "systemd-logind",
+        "dbus-broker",
+        "dbus-daemon",
+        "steamos-manager",
         "pipewire",
+        "pipewire-pulse",
         "wireplumber",
+        "mangoapp",
+        "wineserver",
         "plugin_loader",
         "kwin_wayland",
         "plasmashell",
+        "polkitd",
+        "bluetoothd",
+        "networkmanager",
+        "sshd",
         "python",
         "python3",
         "switchdeckd",
@@ -46,6 +60,7 @@ _PROTECTED_PROCESS_COMMS: frozenset[str] = frozenset(
         "zsh",
     }
 )
+_NUMERIC_IPV4_LABEL_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)$")
 
 
 def validate_neptune_iface(
@@ -69,7 +84,7 @@ def validate_wakeup_path(
     target: str | Path,
     sys_devices_root: str = "/sys/devices/",
 ) -> Path | None:
-    """Resolve and verify a sysfs power/wakeup node stays under sys_devices_root."""
+    """Resolve and verify a USB sysfs power/wakeup node stays under sys_devices_root."""
     if not target or not sys_devices_root:
         return None
     raw = str(target)
@@ -78,6 +93,7 @@ def validate_wakeup_path(
     try:
         real = os.path.realpath(raw)
         root_real = os.path.realpath(sys_devices_root)
+        default_sys_real = os.path.realpath("/sys/devices")
     except (OSError, ValueError, TypeError):
         return None
     if not root_real.endswith("/"):
@@ -86,7 +102,18 @@ def validate_wakeup_path(
         return None
     if not real.startswith(root_real) or not real.endswith("/power/wakeup"):
         return None
-    return Path(real)
+    resolved = Path(real)
+    rel_parts = resolved.relative_to(Path(root_real.rstrip("/"))).parts
+    usb_dev_dir = resolved.parent.parent
+    has_id_vendor = (usb_dev_dir / "idVendor").is_file()
+    if root_real.rstrip("/") == default_sys_real:
+        if not has_id_vendor:
+            return None
+    else:
+        has_usb_ancestor = any(part.lower().startswith("usb") for part in rel_parts)
+        if not (has_id_vendor or has_usb_ancestor):
+            return None
+    return resolved
 
 
 def safe_write_sysfs(path: Path, value: str) -> bool:
@@ -114,6 +141,13 @@ def safe_write_sysfs(path: Path, value: str) -> bool:
                 pass
 
 
+def _validate_ip_literal(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, raw_host: str) -> None:
+    if ip_obj.is_unspecified or ip_obj.is_multicast:
+        raise ValueError(f"Unsupported unspecified/multicast host address: {raw_host!r}")
+    if str(ip_obj) == "169.254.169.254":
+        raise ValueError(f"Rejected metadata endpoint IP address: {raw_host!r}")
+
+
 def validate_host(host: str) -> str:
     """Validate an IPv4/IPv6 address or RFC-1123 hostname without URL/CRLF delimiters."""
     if not isinstance(host, str):
@@ -128,10 +162,17 @@ def validate_host(host: str) -> str:
             raise ValueError(f"Invalid character in host: {host!r}")
 
     try:
-        ipaddress.ip_address(cleaned)
+        ip_obj = ipaddress.ip_address(cleaned)
+        _validate_ip_literal(ip_obj, host)
         return cleaned
-    except ValueError:
-        pass
+    except ValueError as exc:
+        if "Unsupported" in str(exc) or "Rejected metadata" in str(exc):
+            raise
+
+    # Reject decimal integers, hex (0x7f000001), and octal (0177.0.0.1) IPv4 forms
+    labels = cleaned.rstrip(".").split(".")
+    if labels and all(_NUMERIC_IPV4_LABEL_RE.fullmatch(lbl) for lbl in labels):
+        raise ValueError(f"Invalid numeric/hex/octal IPv4 host: {host!r}")
 
     if ":" in cleaned or not _RFC1123_HOST_RE.fullmatch(cleaned):
         raise ValueError(f"Invalid host format: {host!r}")
@@ -164,17 +205,20 @@ def validate_hdmi_input(hdmi_input: str) -> str:
 
 
 def validate_webhook_url(url: str) -> str:
-    """Validate an HTTP/HTTPS webhook URL without control/CRLF characters."""
+    """Validate an HTTP/HTTPS webhook URL without control/CRLF/userinfo/SSRFS."""
     if not isinstance(url, str):
         raise ValueError("Webhook URL must be a string")
     if "\r" in url or "\n" in url or any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
         raise ValueError("Webhook URL must not contain CR/LF or control characters")
     cleaned = url.strip()
     if not cleaned or any(ch.isspace() for ch in cleaned):
-        raise ValueError(f"Invalid webhook URL: {url!r}")
+        raise ValueError("Invalid webhook URL")
     parsed = urllib.parse.urlsplit(cleaned)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-        raise ValueError(f"Webhook URL must use http/https with a valid hostname: {url!r}")
+        raise ValueError("Webhook URL must use http/https with a valid hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Webhook URL must not contain userinfo credentials")
+    validate_host(parsed.hostname)
     return cleaned
 
 
@@ -229,11 +273,33 @@ def capture_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> str 
     return fields[19]
 
 
-def validate_game_pid(pid: int, proc_root: Path = Path("/proc")) -> tuple[bool, str | None]:
+def validate_game_pid(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    expected_uid: int | None = None,
+) -> tuple[bool, str | None]:
     """Verify a PID is a safe non-system target and return (is_valid, starttime)."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 100 or pid == os.getpid():
         return False, None
-    comm_path = proc_root / str(pid) / "comm"
+    proc_dir = proc_root / str(pid)
+    if proc_dir.exists():
+        try:
+            st = proc_dir.stat()
+        except OSError:
+            return False, None
+        if expected_uid is not None and expected_uid > 0 and st.st_uid != expected_uid:
+            return False, None
+        if proc_root == Path("/proc") and st.st_uid == 0:
+            return False, None
+        exe_path = proc_dir / "exe"
+        try:
+            if exe_path.is_symlink():
+                exe_name = os.path.basename(os.readlink(exe_path)).lower()
+                if exe_name in _PROTECTED_PROCESS_COMMS:
+                    return False, None
+        except OSError:
+            pass
+    comm_path = proc_dir / "comm"
     if comm_path.exists():
         try:
             comm = comm_path.read_text(encoding="utf-8", errors="replace").strip().lower()
@@ -254,22 +320,33 @@ def atomic_write_json(
     uid: int | None = None,
     gid: int | None = None,
 ) -> None:
-    """Atomically serialize JSON to disk with fsync, mode, and optional ownership."""
+    """Atomically serialize JSON to disk with symlink rejection, fchmod/fchown, fsync, and os.replace."""
+    if os.path.lexists(path) and os.path.islink(path):
+        raise OSError(f"Refusing to overwrite symlink: {path}")
+
     missing_parents: list[Path] = []
     cur = path.parent
     while not cur.exists():
+        if os.path.lexists(cur) and cur.is_symlink():
+            raise OSError(f"Refusing to traverse symlink parent: {cur}")
         missing_parents.append(cur)
         parent = cur.parent
         if parent == cur:
             break
         cur = parent
 
+    if path.parent.exists() and path.parent.is_symlink():
+        raise OSError(f"Refusing to write inside symlink directory: {path.parent}")
+
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.parent.is_symlink():
+        raise OSError(f"Refusing to write inside symlink directory: {path.parent}")
+
     if uid is not None and gid is not None:
         for created_dir in reversed(missing_parents):
             try:
                 os.chmod(created_dir, 0o700)
-                os.chown(created_dir, uid, gid)
+                os.chown(created_dir, uid, gid, follow_symlinks=False)
             except (PermissionError, OSError, AttributeError):
                 pass
 
@@ -286,15 +363,27 @@ def atomic_write_json(
             tmp_name = tf.name
             tf.write(payload)
             tf.flush()
-            os.fsync(tf.fileno())
-        os.chmod(tmp_name, mode)
-        if uid is not None and gid is not None:
-            try:
-                os.chown(tmp_name, uid, gid)
-            except (PermissionError, OSError, AttributeError):
-                pass
+            fd = tf.fileno()
+            os.fchmod(fd, mode)
+            if uid is not None and gid is not None:
+                try:
+                    os.fchown(fd, uid, gid)
+                except (PermissionError, OSError, AttributeError):
+                    pass
+            os.fsync(fd)
+        if os.path.lexists(path) and os.path.islink(path):
+            raise OSError(f"Refusing to replace symlink target: {path}")
         os.replace(tmp_name, path)
         tmp_name = None
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            dir_fd = os.open(os.fspath(path.parent), dir_flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     finally:
         if tmp_name is not None:
             try:
@@ -486,17 +575,17 @@ def apply_runtime_overclock_sysfs(
     if hwmon_dir is None:
         return False
 
-    p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 22_000_000
-    target_p1_uw = min(watts_val * 1_000_000, p1_max_uw)
-    p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
-    if p1_path is None or not p1_path.exists() or not safe_write_sysfs(p1_path, f"{target_p1_uw}\n"):
-        return False
-
     p2_path = _resolve_under_root(hwmon_dir / "power2_cap", root_real)
     if p2_path is not None and p2_path.exists():
         p2_max_uw = _read_sysfs_int(hwmon_dir / "power2_cap_max") or 24_000_000
         target_p2_uw = min((watts_val + 2) * 1_000_000, p2_max_uw, 24_000_000)
         safe_write_sysfs(p2_path, f"{target_p2_uw}\n")
+
+    p1_max_uw = _read_sysfs_int(hwmon_dir / "power1_cap_max") or 22_000_000
+    target_p1_uw = min(watts_val * 1_000_000, p1_max_uw)
+    p1_path = _resolve_under_root(hwmon_dir / "power1_cap", root_real)
+    if p1_path is None or not p1_path.exists() or not safe_write_sysfs(p1_path, f"{target_p1_uw}\n"):
+        return False
 
     dpm_level = _resolve_under_root(dev_dir / "power_dpm_force_performance_level", root_real)
     pp_od = _resolve_under_root(dev_dir / "pp_od_clk_voltage", root_real)
@@ -506,14 +595,18 @@ def apply_runtime_overclock_sysfs(
                 safe_write_sysfs(pp_od, "s 0 400\n")
                 safe_write_sysfs(pp_od, f"s 1 {gpu_mhz}\n")
                 safe_write_sysfs(pp_od, "c\n")
-    elif gpu_mhz == 0 and dpm_level is not None and dpm_level.exists():
-        safe_write_sysfs(dpm_level, "auto\n")
+    elif gpu_mhz == 0:
+        if pp_od is not None and pp_od.exists():
+            safe_write_sysfs(pp_od, "r\n")
+            safe_write_sysfs(pp_od, "c\n")
+        if dpm_level is not None and dpm_level.exists():
+            safe_write_sysfs(dpm_level, "auto\n")
 
     _write_cpufreq_controls(
         cpu_root=cpu_root,
         root_real=root_real,
         boost_enabled=boost_flag,
-        target_governor="performance" if boost_flag else "schedutil",
+        target_governor="schedutil",
     )
     return True
 

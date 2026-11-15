@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 from typing import Iterable
 
@@ -28,8 +29,10 @@ def _encode_pnp_id(pnp: str) -> bytes:
 
 
 def parse_edid(raw: bytes) -> EdidInfo | None:
-    """Parse a 128+ byte binary EDID blob from `/sys/class/drm/.../edid`."""
+    """Parse and checksum-verify a 128+ byte binary EDID blob from `/sys/class/drm/.../edid`."""
     if len(raw) < 128 or raw[:8] != EDID_MAGIC:
+        return None
+    if (sum(raw[:128]) % 256) != 0:
         return None
 
     manufacturer_id = _decode_pnp_id(raw[8:10])
@@ -38,20 +41,31 @@ def parse_edid(raw: bytes) -> EdidInfo | None:
 
     native_width = 0
     native_height = 0
+    native_refresh_hz = 60.0
     monitor_name = ""
 
     # Detailed timing descriptor 1 sits at bytes 54..71
     dtd0 = raw[54:72]
-    if dtd0[0] != 0 or dtd0[1] != 0:
+    pclk_10khz = struct.unpack("<H", dtd0[0:2])[0]
+    if pclk_10khz != 0:
         native_width = dtd0[2] | ((dtd0[4] >> 4) << 8)
         native_height = dtd0[5] | ((dtd0[7] >> 4) << 8)
+        h_blank = dtd0[3] | ((dtd0[4] & 0x0F) << 8)
+        v_blank = dtd0[6] | ((dtd0[7] & 0x0F) << 8)
+        h_total = native_width + h_blank
+        v_total = native_height + v_blank
+        if h_total > 0 and v_total > 0:
+            calc_hz = (pclk_10khz * 10_000.0) / (h_total * v_total)
+            if math.isfinite(calc_hz) and 20.0 <= calc_hz <= 360.0:
+                native_refresh_hz = round(calc_hz, 2)
 
     # Scan the four 18-byte descriptor slots for monitor name (tag 0xFC)
     for offset in (54, 72, 90, 108):
         slot = raw[offset : offset + 18]
         if slot[:3] == b"\x00\x00\x00" and slot[3] == 0xFC:
             raw_name = slot[5:18].split(b"\n", 1)[0]
-            monitor_name = raw_name.decode("ascii", errors="ignore").strip()
+            decoded = raw_name.decode("ascii", errors="ignore")
+            monitor_name = "".join(ch for ch in decoded if 32 <= ord(ch) <= 126).strip()
             break
 
     if not monitor_name:
@@ -64,6 +78,7 @@ def parse_edid(raw: bytes) -> EdidInfo | None:
         native_width=native_width,
         native_height=native_height,
         fingerprint=fingerprint,
+        native_refresh_hz=native_refresh_hz,
     )
 
 
@@ -73,6 +88,7 @@ def make_synthetic_edid(
     monitor_name: str = "SAMSUNG S90C",
     native_width: int = 3840,
     native_height: int = 2160,
+    native_refresh_hz: float = 60.0,
 ) -> bytes:
     """Build a valid 128-byte EDID block for simulation and testing."""
     buf = bytearray(128)
@@ -82,12 +98,19 @@ def make_synthetic_edid(
     buf[18] = 1
     buf[19] = 4  # EDID 1.4
 
-    # Detailed timing descriptor 0 with non-zero pixel clock + active W/H
-    buf[54:56] = struct.pack("<H", 59400)  # 594.00 MHz
+    # Detailed timing descriptor 0 with realistic pixel clock + blanking
+    h_blank = 160
+    v_blank = 45
+    h_total = max(1, native_width) + h_blank
+    v_total = max(1, native_height) + v_blank
+    pclk_10khz = max(1, min(65535, int(round((h_total * v_total * native_refresh_hz) / 10_000.0))))
+    buf[54:56] = struct.pack("<H", pclk_10khz)
     buf[56] = native_width & 0xFF
-    buf[58] = ((native_width >> 8) & 0x0F) << 4
+    buf[57] = h_blank & 0xFF
+    buf[58] = (((native_width >> 8) & 0x0F) << 4) | ((h_blank >> 8) & 0x0F)
     buf[59] = native_height & 0xFF
-    buf[61] = ((native_height >> 8) & 0x0F) << 4
+    buf[60] = v_blank & 0xFF
+    buf[61] = (((native_height >> 8) & 0x0F) << 4) | ((v_blank >> 8) & 0x0F)
 
     # Monitor name descriptor in slot 1 (bytes 72..89)
     buf[72:77] = b"\x00\x00\x00\xfc\x00"
@@ -114,7 +137,11 @@ def select_best_output_mode(
        clean 16:9 resolutions up to prefer_max_height, preferring 1080p@120Hz or
        1440p@60/120Hz or 4K@60Hz over 4K@30Hz.
     """
-    candidates = [m for m in modes if m.width > 0 and m.height > 0]
+    candidates = [
+        m
+        for m in modes
+        if m.width > 0 and m.height > 0 and math.isfinite(m.refresh_hz) and m.refresh_hz > 0.0
+    ]
     if not candidates:
         return None
 

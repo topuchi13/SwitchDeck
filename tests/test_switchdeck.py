@@ -21,6 +21,7 @@ import threading
 import types
 import unittest
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -77,7 +78,11 @@ from switchdeck.tv import (
     RokuEcpDriver,
     SamsungTizenDriver,
     SonyBraviaDriver,
+    TvDriverConfig,
+    WebhookTvDriver,
     WS_GUID,
+    _redact_url_for_log,
+    _ws_read_text_frame,
     WakeOnLanTvDriver,
     _WsPayloadTooLarge,
 )
@@ -609,7 +614,7 @@ class TestProfileStoreAndDomainClamping(unittest.TestCase):
                 "preferred_container_height": 4320,
             }
         )
-        self.assertEqual(clamped_hi.docked_tdp_watts, 30)
+        self.assertEqual(clamped_hi.docked_tdp_watts, 15)
         self.assertEqual(clamped_hi.handheld_tdp_watts, 15)
         self.assertEqual(clamped_hi.fsr_sharpness, 20)
         self.assertEqual(clamped_hi.docked_charge_limit, 100)
@@ -1076,9 +1081,9 @@ class TestCoordinatorHardening(unittest.TestCase):
             self.assertEqual(s_chg_off.charge_limit, 80)
 
             updated = coord.update_active_profile({"docked_tdp_watts": 99, "fsr_sharpness": 5})
-            self.assertEqual(updated.docked_tdp_watts, 30)
+            self.assertEqual(updated.docked_tdp_watts, 15)
             self.assertEqual(updated.fsr_sharpness, 5)
-            self.assertEqual(coord.reconcile().tdp_watts, 30)
+            self.assertEqual(coord.reconcile().tdp_watts, 15)
 
             # Undock increments transition_seq to 2 and resets manual overrides
             mock_hw.detach_hub(keep_wireless_controller=True)
@@ -1132,7 +1137,7 @@ class TestDaemonUnixSocketIpc(unittest.IsolatedAsyncioTestCase):
 
                     r_prof = await _rpc({"cmd": "update_profile", "patch": {"docked_tdp_watts": 99}})
                     self.assertTrue(r_prof["ok"])
-                    self.assertEqual(r_prof["profile"]["docked_tdp_watts"], 30)
+                    self.assertEqual(r_prof["profile"]["docked_tdp_watts"], 15)
 
                     r_rebind = await _rpc({"cmd": "rebind_builtin"})
                     self.assertTrue(r_rebind["ok"])
@@ -1204,8 +1209,10 @@ class TestDeckyPluginLifecycle(unittest.IsolatedAsyncioTestCase):
                         prof = await plugin.get_active_profile()
                         self.assertEqual(prof["display_name"], "SAMSUNG S90C")
 
-                        upd = await plugin.update_profile({"docked_tdp_watts": 22})
-                        self.assertEqual(upd["docked_tdp_watts"], 22)
+                        upd = await plugin.update_profile({"docked_tdp_watts": 14})
+                        self.assertEqual(upd["docked_tdp_watts"], 14)
+                        upd_clamped = await plugin.update_profile({"docked_tdp_watts": 99})
+                        self.assertEqual(upd_clamped["docked_tdp_watts"], 15)
 
                         st_keep = await plugin.set_keep_builtin(True)
                         self.assertTrue(st_keep["builtin_controller_bound"])
@@ -1267,6 +1274,7 @@ class TestDeckyZipIntegrity(unittest.TestCase):
                 self.assertNotIn("__pycache__", entry)
                 self.assertFalse(entry.endswith(".pyc"), f"Unexpected bytecode in ZIP: {entry}")
                 self.assertFalse(entry.endswith(".png"), f"Unexpected PNG screenshot in ZIP: {entry}")
+                self.assertFalse(entry.endswith(".map"), f"Unexpected sourcemap in ZIP: {entry}")
 
 
 class TestDockedOverclockAndGuardrails(unittest.TestCase):
@@ -1390,8 +1398,8 @@ class TestDockedOverclockAndGuardrails(unittest.TestCase):
                 self.assertEqual(
                     recorded_writes,
                     [
-                        ("power1_cap", "20000000\n"),
                         ("power2_cap", "22000000\n"),
+                        ("power1_cap", "20000000\n"),
                         ("power_dpm_force_performance_level", "manual\n"),
                         ("pp_od_clk_voltage", "s 0 400\n"),
                         ("pp_od_clk_voltage", "s 1 1800\n"),
@@ -2057,6 +2065,233 @@ class TestMultiBrandSmartTvDrivers(unittest.IsolatedAsyncioTestCase):
             srv.shutdown()
             srv.server_close()
             t.join(timeout=2.0)
+
+
+class TestV041AuditHardening(unittest.TestCase):
+    def test_security_ssrf_host_webhook_and_atomic_symlink_rejection(self) -> None:
+        self.assertEqual(validate_host("127.0.0.1"), "127.0.0.1")
+        for bad_host in (
+            "169.254.169.254",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "0x7f000001",
+            "2130706433",
+            "0177.0.0.1",
+        ):
+            with self.assertRaises(ValueError, msg=f"validate_host unexpectedly accepted {bad_host}"):
+                validate_host(bad_host)
+
+        with self.assertRaises(ValueError):
+            validate_webhook_url("http://user:pass@tv.local/hook")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / "victim.json"
+            secret.write_text('{"keep": true}', encoding="utf-8")
+            link_target = root / "profiles.json"
+            link_target.symlink_to(secret)
+            with self.assertRaises(OSError):
+                atomic_write_json(link_target, {"overwritten": True})
+
+            real_dir = root / "real_dir"
+            real_dir.mkdir()
+            link_dir = root / "link_dir"
+            link_dir.symlink_to(real_dir)
+            with self.assertRaises(OSError):
+                atomic_write_json(link_dir / "nested.json", {"overwritten": True})
+
+    def test_tv_webhook_redirect_blocked_and_url_redacted(self) -> None:
+        secret_hit = {"called": False}
+
+        class _RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                port = self.server.server_port
+                if self.path.startswith("/hook"):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{port}/secret")
+                    self.end_headers()
+                    return
+                if self.path.startswith("/secret"):
+                    secret_hit["called"] = True
+                    self.send_response(200)
+                    self.end_headers()
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                if self.path.startswith("/secret"):
+                    secret_hit["called"] = True
+                self.send_response(200)
+                self.end_headers()
+
+        srv = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_port}/hook?token=secret123"
+            cfg = TvDriverConfig(
+                driver="webhook",
+                webhook_url=url,
+                auto_power_on=True,
+                auto_switch_input=True,
+            )
+            ok = WebhookTvDriver().wake_and_switch(cfg)
+            self.assertFalse(ok)
+            self.assertFalse(secret_hit["called"])
+            self.assertEqual(
+                _redact_url_for_log("https://ha.local:8123/api/webhook/secret?token=abc"),
+                "https://ha.local:8123/...",
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=2.0)
+
+    def test_ws_read_text_frame_reassembles_continuation_frames(self) -> None:
+        s_send, s_recv = socket.socketpair()
+        try:
+            frame1 = bytes([0x01, 7]) + b"Hello, "
+            frame2 = bytes([0x80, 11]) + b"SwitchDeck!"
+            s_send.sendall(frame1 + frame2)
+            s_send.close()
+            text = _ws_read_text_frame(s_recv, timeout=1.0)
+            self.assertEqual(text, "Hello, SwitchDeck!")
+        finally:
+            try:
+                s_send.close()
+            except OSError:
+                pass
+            s_recv.close()
+
+    def test_profile_store_mtime_reload_and_cloned_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp)
+            store = ProfileStore(cfg_dir)
+            prof = store.get_profile("default")
+            orig_host = prof.tv.host
+            prof.tv.host = "mutated"
+            self.assertEqual(store.get_profile("default").tv.host, orig_host)
+
+            clean_prof = store.get_profile("default")
+            store.put_profile(clean_prof)
+            profiles_path = cfg_dir / "profiles.json"
+            data = json.loads(profiles_path.read_text(encoding="utf-8"))
+            data["default"]["docked_tdp_watts"] = 13
+            st = profiles_path.stat()
+            profiles_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.utime(profiles_path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+            self.assertEqual(store.get_profile("default").docked_tdp_watts, 13)
+
+    def test_edid_refresh_and_linux_transport_dongle_wakeup(self) -> None:
+        raw = make_synthetic_edid(
+            manufacturer_id="DEL",
+            product_code=0x1234,
+            monitor_name="DELL 120HZ",
+            native_width=1920,
+            native_height=1080,
+            native_refresh_hz=120.0,
+        )
+        info = parse_edid(raw)
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertLess(abs(info.native_refresh_hz - 120.0), 2.0)
+
+        backend = LinuxHardwareBackend()
+        try:
+            self.assertEqual(
+                backend._classify_transport("/sys/devices/virtual/input/input9", "045e", "028e"),
+                "uinput",
+            )
+            self.assertEqual(
+                backend._classify_transport(
+                    "/sys/devices/pci0000:00/usb1/input/input5",
+                    "045e",
+                    "0b12",
+                    name="2.4G Wireless Receiver",
+                    bus_type="0003",
+                ),
+                "dongle_24g",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                input_dir = Path(tmp) / "input5"
+                power_dir = input_dir / "device" / "power"
+                power_dir.mkdir(parents=True)
+                wake_node = power_dir / "wakeup_count"
+                wake_node.write_text("5\n", encoding="utf-8")
+                awake_1, cnt_1 = backend._is_dongle_actively_awake(input_dir, "dongle_24g")
+                self.assertFalse(awake_1)
+                self.assertEqual(cnt_1, 5)
+                wake_node.write_text("6\n", encoding="utf-8")
+                awake_2, cnt_2 = backend._is_dongle_actively_awake(input_dir, "dongle_24g")
+                self.assertTrue(awake_2)
+                self.assertEqual(cnt_2, 6)
+        finally:
+            backend.close()
+
+    def test_coordinator_thermal_fail_closed_and_inspect_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mock_hw = MockHardwareBackend(ac_online=True, apu_temp_c=None)
+            mock_hw.attach_samsung_s90c_hub(include_24g_xbox_dongle=True, pad_awake=True)
+            mock_hw.ac_online = True
+            mock_hw.apu_temp_c = None
+            coord = SwitchDeckCoordinator(mock_hw, store=ProfileStore(Path(tmp) / "oc"))
+            coord.update_active_profile(
+                {
+                    "overclock": {
+                        "enabled": True,
+                        "risk_acknowledged": True,
+                        "boost_tdp_watts": 20,
+                    }
+                }
+            )
+            status = coord.reconcile()
+            self.assertFalse(mock_hw.overclock_applied)
+            self.assertFalse(status.overclock_active)
+            self.assertIn("sensor", (status.overclock_status_note or "").lower())
+
+            fresh_hw = MockHardwareBackend()
+            fresh_coord = SwitchDeckCoordinator(fresh_hw, store=ProfileStore(Path(tmp) / "ro"))
+            ro_status = fresh_coord.inspect_status()
+            self.assertFalse(ro_status.is_docked)
+            self.assertEqual(fresh_hw.events_log, [])
+
+    def test_daemon_single_instance_flock_and_cli_doctor(self) -> None:
+        import contextlib
+        import fcntl
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sock_path = root / "switchdeckd.sock"
+            d1 = SwitchDeckDaemon(backend=MockHardwareBackend(), socket_path=sock_path)
+            d2 = SwitchDeckDaemon(backend=MockHardwareBackend(), socket_path=sock_path)
+            fd1 = d1._acquire_instance_lock()
+            try:
+                with self.assertRaises(RuntimeError):
+                    d2._acquire_instance_lock()
+            finally:
+                try:
+                    fcntl.flock(fd1, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd1)
+
+            cfg_dir = root / "cli_cfg"
+            stdout_buf = io.StringIO()
+            doc_hw = MockHardwareBackend()
+            setattr(doc_hw, "close", lambda: None)
+            with (
+                mock.patch("switchdeck.cli.LinuxHardwareBackend", return_value=doc_hw),
+                mock.patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": str(cfg_dir)}),
+                contextlib.redirect_stdout(stdout_buf),
+            ):
+                rc = cli_main(["doctor"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Deck Model", stdout_buf.getvalue())
 
 
 if __name__ == "__main__":

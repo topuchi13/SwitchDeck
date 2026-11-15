@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import atexit
 import errno
+import fcntl
 import json
 import logging
 import os
 import signal
 import socket
+import ssl
 import stat
 import sys
 from pathlib import Path
@@ -56,6 +58,7 @@ class SwitchDeckDaemon:
         self._reconcile_pending = False
         self._netlink_sock: socket.socket | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._instance_lock_fd: int | None = None
         self._last_status: Any = None
         try:
             self._last_status = self.coordinator.reconcile()
@@ -220,7 +223,7 @@ class SwitchDeckDaemon:
                 hdmi_input = str(req.get("hdmi_input") or "")
                 psk = str(req.get("psk") or "")
                 trust_new_cert = bool(req.get("trust_new_cert"))
-                async with self._reconcile_lock:
+                try:
                     response = await asyncio.to_thread(
                         self.coordinator.pair_tv,
                         driver_name,
@@ -231,10 +234,22 @@ class SwitchDeckDaemon:
                         psk,
                         trust_new_cert,
                     )
+                except ssl.SSLCertVerificationError as exc:
+                    response = {"ok": False, "cert_mismatch": True, "error": str(exc)}
+                except (ValueError, OSError, ConnectionError) as exc:
+                    response = {"ok": False, "cert_mismatch": False, "error": str(exc)}
             elif cmd == "test_tv":
-                async with self._reconcile_lock:
-                    woken = await asyncio.to_thread(self.coordinator.test_active_tv_wake)
-                    response = {"ok": True, "woken": woken}
+                woken = await asyncio.to_thread(self.coordinator.test_active_tv_wake)
+                if woken:
+                    response = {"ok": True, "woken": True}
+                else:
+                    err = getattr(self.coordinator, "_last_error", None) or "TV wake failed"
+                    response = {
+                        "ok": False,
+                        "woken": False,
+                        "cert_mismatch": "fingerprint mismatch" in str(err).lower(),
+                        "error": str(err),
+                    }
             else:
                 response = {"ok": False, "error": f"Unknown command: {cmd}"}
 
@@ -253,6 +268,23 @@ class SwitchDeckDaemon:
             except OSError:
                 pass
 
+    def _acquire_instance_lock(self) -> int:
+        lock_path = self.socket_path.with_name(f"{self.socket_path.name}.lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(lock_path), flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise RuntimeError(f"Another switchdeckd instance already holds {lock_path}") from exc
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EAGAIN, errno.EACCES):
+                raise RuntimeError(f"Another switchdeckd instance already holds {lock_path}") from exc
+            raise
+        return fd
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         atexit.register(self.coordinator.close)
@@ -263,18 +295,23 @@ class SwitchDeckDaemon:
                 pass
 
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._safe_unlink_socket(missing_ok=True)
-
-        self._server = await asyncio.start_unix_server(
-            self._handle_ipc_client,
-            path=str(self.socket_path),
-            limit=MAX_IPC_REQUEST_BYTES,
-        )
-        os.chmod(self.socket_path, 0o600)
-        self._start_netlink(loop)
-        LOG.info("switchdeckd listening on %s", self.socket_path)
-
+        lock_fd = self._acquire_instance_lock()
+        self._instance_lock_fd = lock_fd
         try:
+            self._safe_unlink_socket(missing_ok=True)
+            old_umask = os.umask(0o177)
+            try:
+                self._server = await asyncio.start_unix_server(
+                    self._handle_ipc_client,
+                    path=str(self.socket_path),
+                    limit=MAX_IPC_REQUEST_BYTES,
+                )
+            finally:
+                os.umask(old_umask)
+            os.chmod(self.socket_path, 0o600)
+            self._start_netlink(loop)
+            LOG.info("switchdeckd listening on %s", self.socket_path)
+
             while not self._stop_event.is_set():
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=self.observer_interval_sec)
@@ -303,6 +340,17 @@ class SwitchDeckDaemon:
             except OSError:
                 pass
             await asyncio.to_thread(self.coordinator.close)
+            atexit.unregister(self.coordinator.close)
+            if self._instance_lock_fd is not None:
+                try:
+                    fcntl.flock(self._instance_lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(self._instance_lock_fd)
+                except OSError:
+                    pass
+                self._instance_lock_fd = None
 
 
 def main() -> int:

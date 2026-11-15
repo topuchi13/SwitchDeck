@@ -35,11 +35,12 @@ export interface SwitchToastCardProps {
 export const SwitchToastCard: FC<SwitchToastCardProps> = ({ transition, compact = false }) => {
   const isDocked = transition.kind === "docked";
   const isOc = Boolean(transition.overclock_active);
+  const ocTag = isOc ? " OC" : "";
+  const chargeTag =
+    transition.charge_limit > 0 ? `${transition.charge_limit}% Cap` : "100% Cap";
   const powerLabel =
     transition.tdp_watts != null
-      ? `${transition.tdp_watts}W ${isOc ? "OC" : ""}· ${
-          transition.charge_limit > 0 ? `${transition.charge_limit}% Cap` : "100% Cap"
-        }`.replace("  ", " ")
+      ? `${transition.tdp_watts}W${ocTag} · ${chargeTag}`
       : transition.charge_limit > 0
         ? `${transition.charge_limit}% Cap`
         : "Uncapped";

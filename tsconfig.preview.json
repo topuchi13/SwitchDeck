@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@decky/ui": ["./preview/deckyUiShim.tsx"]
+    }
+  },
+  "include": [
+    "src/index.tsx",
+    "src/ui/**/*.ts",
+    "src/ui/**/*.tsx",
+    "preview/**/*.ts",
+    "preview/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "build",
+    "py_modules"
+  ]
+}

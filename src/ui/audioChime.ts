@@ -18,12 +18,17 @@ function getAudioContext(): AudioContext | null {
     if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
       sharedAudioCtx = new Ctor();
     }
-    if (sharedAudioCtx.state === "suspended") {
-      void sharedAudioCtx.resume().catch(() => undefined);
-    }
     return sharedAudioCtx;
   } catch {
     return null;
+  }
+}
+
+export function disposeAudioChime(): void {
+  const ctx = sharedAudioCtx;
+  sharedAudioCtx = null;
+  if (ctx && ctx.state !== "closed") {
+    void ctx.close().catch(() => undefined);
   }
 }
 
@@ -49,18 +54,14 @@ export function setChimeAndToastEnabled(enabled: boolean): void {
   }
 }
 
-/**
- * Synthesize the mechanical two-tone Nintendo Switch "Click-Clack" rail chime:
- * Phase 1 (12ms subtle mechanical click) + Phase 2 (65ms crisp resonant snap).
- * Safe no-op if WebAudio AudioContext is unavailable or blocked.
- */
-export function playSwitchClickClack(kind: "docked" | "undocked" = "docked"): void {
-  const ctx = getAudioContext();
-  if (!ctx) {
-    return;
-  }
-
+function scheduleClickClackNodes(
+  ctx: AudioContext,
+  kind: "docked" | "undocked",
+): void {
   try {
+    if (ctx.state !== "running") {
+      return;
+    }
     const now = ctx.currentTime + 0.005;
 
     // Phase 1: 12ms subtle tactile slide-click
@@ -118,5 +119,29 @@ export function playSwitchClickClack(kind: "docked" | "undocked" = "docked"): vo
     harmonicOsc.stop(snapTime + 0.052);
   } catch {
     // Safe no-op if audio graph fails
+  }
+}
+
+/**
+ * Synthesize the mechanical two-tone Nintendo Switch "Click-Clack" rail chime:
+ * Phase 1 (12ms subtle mechanical click) + Phase 2 (65ms crisp resonant snap).
+ * Safe no-op if WebAudio AudioContext is unavailable or blocked.
+ */
+export function playSwitchClickClack(kind: "docked" | "undocked" = "docked"): void {
+  const ctx = getAudioContext();
+  if (!ctx) {
+    return;
+  }
+  if (ctx.state === "running") {
+    scheduleClickClackNodes(ctx, kind);
+    return;
+  }
+  if (ctx.state === "suspended") {
+    void ctx
+      .resume()
+      .then(() => {
+        scheduleClickClackNodes(ctx, kind);
+      })
+      .catch(() => undefined);
   }
 }
