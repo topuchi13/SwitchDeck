@@ -4,6 +4,10 @@
 
 SwitchDeck coordinates controller Player-1 handoffs (`28de:1205` Neptune bind/unbind), live Gamescope resolution/FSR scaling, PipeWire audio routing with split handheld/docked volumes, `steamos-manager` TDP & 80% battery charge caps, LCD dock-gated Bluetooth wake, and universal HDMI-CEC + Wi-Fi Smart TV switching — with **zero external Python runtime dependencies** (`Python 3.10+` stdlib only).
 
+![SwitchDeck Docked on Samsung S90C with Switch Click-Clack HUD Toast and Decky Quick Access Menu](docs/screenshots/docked_s90c_1920x1080.png)
+
+*Docked on Samsung S90C (`2560x1440@120Hz VRR`): Switch Click-Clack glassmorphism HUD toast + SteamOS Quick Access Menu (`•••`) showing 2.4GHz Xbox Player-1 promotion, `1080p -> 1440p` FSR scaling, and `80%` battery charge cap.*
+
 ---
 
 ## Quick Demo & Tests (macOS / Linux Without a Steam Deck)
@@ -63,6 +67,11 @@ bash ./scripts/uninstall.sh
 ---
 
 ## Switch Click-Clack HUD Toast & Quick Access Menu (QAM)
+
+| Handheld Mode (`1280x800` LCD) | Hardware / Driver Alert (`045e:02fe`) | Scaling & TOFU TLS TV Pairing |
+| :---: | :---: | :---: |
+| ![Handheld Mode on Steam Deck LCD](docs/screenshots/handheld_1280x800.png) | ![Hardware Driver Alert for 045e:02fe Dongle](docs/screenshots/docked_warning_1920x1080.png) | ![Scaling Profile and Samsung Tizen TOFU TLS Pinning](docs/screenshots/tv_pairing_1280x800.png) |
+| Built-in `28de:1205` bound, `11W` TDP, LCD BT wake locked off | Actionable remediation when `xone`/`xow` driver is missing | Per-display FSR/TDP sliders & SHA-256 TOFU cert pin badges |
 
 - **Switch Click-Clack HUD Toast:** Docking or undocking emits `switchdeck_transition`, playing a synthesized Switch-style rail chime (`src/ui/audioChime.ts`) and displaying a glassmorphism HUD toast (`SwitchToastCard`) summarizing the display, output mode, VRR badge, Player-1 controller, scaling filter, TDP/charge cap, and audio sink.
 - **Hero Status & Alerts:** Displays `Deck LCD` / `Deck OLED`, `Docked` / `Handheld` status, output mode (`VRR`/`AC` pills), Player-1 controller state, active scaling, TDP/charge cap, LCD BT Wake lock state, and actionable warnings (such as proprietary `045e:02fe` Xbox adapters missing `xone`/`xow`).

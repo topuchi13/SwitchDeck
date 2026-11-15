@@ -34,6 +34,7 @@ export const qamStyles = {
     fontFamily: '"Motiva Sans", "Inter", system-ui, -apple-system, sans-serif',
     fontSize: "12px",
     lineHeight: 1.4,
+    paddingBottom: "24px",
   } satisfies CSSProperties,
 
   heroCard: {
