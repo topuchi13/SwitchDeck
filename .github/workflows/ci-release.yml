@@ -50,9 +50,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: switchdeck-dist-zip
-          path: |
-            dist-zip/SwitchDeck.zip
-            dist-zip/SwitchDeck-v*.zip
+          path: dist-zip/SwitchDeck.zip
 
   release:
     needs: build-and-test
@@ -71,8 +69,6 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist-zip/SwitchDeck.zip
-            dist-zip/SwitchDeck-v*.zip
+          files: dist-zip/SwitchDeck.zip
           fail_on_unmatched_files: true
           generate_release_notes: true

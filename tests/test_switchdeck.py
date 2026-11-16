@@ -1250,28 +1250,41 @@ class TestDeckyZipIntegrity(unittest.TestCase):
     def test_decky_zip_package_structure(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         pkg_meta = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
-        version = pkg_meta["version"]
-        zip_path = repo_root / "dist-zip" / f"SwitchDeck-v{version}.zip"
+        dist_zip_dir = repo_root / "dist-zip"
+        zip_path = dist_zip_dir / "SwitchDeck.zip"
         self.assertTrue(
             zip_path.is_file(),
             f"Missing Decky ZIP at {zip_path}; run ./scripts/build_decky_zip.sh",
         )
+        self.assertEqual(
+            [p.name for p in dist_zip_dir.glob("*.zip")],
+            ["SwitchDeck.zip"],
+            "dist-zip should contain only SwitchDeck.zip without duplicate archives",
+        )
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = set(zf.namelist())
             self.assertIn("SwitchDeck/plugin.json", names)
+            self.assertIn("SwitchDeck/package.json", names)
             self.assertIn("SwitchDeck/dist/index.js", names)
             self.assertIn("SwitchDeck/py_modules/switchdeck/coordinator.py", names)
             self.assertIn("SwitchDeck/main.py", names)
+            self.assertNotIn("SwitchDeck/README.md", names)
 
             plugin_meta = json.loads(zf.read("SwitchDeck/plugin.json").decode("utf-8"))
             self.assertEqual(plugin_meta.get("name"), "SwitchDeck")
             self.assertIn("root", plugin_meta.get("flags", []))
+            zip_pkg = json.loads(zf.read("SwitchDeck/package.json").decode("utf-8"))
+            self.assertEqual(zip_pkg.get("version"), pkg_meta["version"])
 
             dist_info = zf.getinfo("SwitchDeck/dist/index.js")
             self.assertGreater(dist_info.file_size, 0)
 
             for entry in names:
                 self.assertNotIn("__pycache__", entry)
+                self.assertNotIn("/preview/", entry)
+                self.assertNotIn("/docs/", entry)
+                self.assertNotIn("/tests/", entry)
+                self.assertFalse(entry.endswith(".DS_Store"), f"Unexpected .DS_Store in ZIP: {entry}")
                 self.assertFalse(entry.endswith(".pyc"), f"Unexpected bytecode in ZIP: {entry}")
                 self.assertFalse(entry.endswith(".png"), f"Unexpected PNG screenshot in ZIP: {entry}")
                 self.assertFalse(entry.endswith(".map"), f"Unexpected sourcemap in ZIP: {entry}")
