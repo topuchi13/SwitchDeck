@@ -1,7 +1,6 @@
 import {
   ButtonItem,
   DropdownItem,
-  Focusable,
   PanelSection,
   PanelSectionRow,
   SliderField,
@@ -12,26 +11,11 @@ import type { DropdownOption } from "@decky/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FC } from "react";
 import {
-  FaBolt,
-  FaCheckCircle,
-  FaExclamationTriangle,
-  FaGamepad,
-  FaLock,
-  FaPlug,
-  FaShieldAlt,
-  FaSlidersH,
-  FaSyncAlt,
-  FaTv,
-  FaVolumeUp,
-  FaWifi,
-} from "react-icons/fa";
-import {
   isChimeAndToastEnabled,
   playSwitchClickClack,
   setChimeAndToastEnabled,
 } from "./audioChime";
-import { COLORS, qamStyles } from "./styles";
-import { SwitchJoyConIcon } from "./SwitchToast";
+import { qamStyles } from "./styles";
 import type {
   DaemonStatus,
   DockProfile,
@@ -47,7 +31,7 @@ export interface QuickAccessPanelProps {
 }
 
 interface FeedbackMessage {
-  tone: "orange" | "crimson" | "sage";
+  tone: "accent" | "crimson" | "sage";
   text: string;
 }
 
@@ -84,19 +68,19 @@ const OVERCLOCK_PRESETS: OverclockPresetDef[] = [
 ];
 
 const CONTAINER_PRESETS: Array<{ key: string; width: number; height: number; label: string }> = [
-  { key: "1920x1080", width: 1920, height: 1080, label: "1920x1080 (1080p Full HD)" },
-  { key: "2560x1440", width: 2560, height: 1440, label: "2560x1440 (1440p QHD)" },
-  { key: "1280x720", width: 1280, height: 720, label: "1280x720 (720p Perf)" },
+  { key: "1920x1080", width: 1920, height: 1080, label: "1080p (1920x1080)" },
+  { key: "2560x1440", width: 2560, height: 1440, label: "1440p (2560x1440)" },
+  { key: "1280x720", width: 1280, height: 720, label: "720p (1280x720)" },
 ];
 
 const TV_DRIVER_OPTIONS: DropdownOption[] = [
-  { data: "cec", label: "HDMI-CEC (Official Dock)" },
-  { data: "samsung_tizen", label: "Samsung Tizen Wi-Fi (S90C)" },
-  { data: "lg_webos", label: "LG webOS Wi-Fi (OLED C/G)" },
-  { data: "sony_bravia", label: "Sony Bravia LAN (PSK)" },
-  { data: "roku_ecp", label: "Roku TV LAN (ECP)" },
-  { data: "wol", label: "Wake-on-LAN Only (Any TV)" },
-  { data: "webhook", label: "Home Assistant / Webhook" },
+  { data: "cec", label: "HDMI-CEC" },
+  { data: "samsung_tizen", label: "Samsung Tizen (Wi-Fi)" },
+  { data: "lg_webos", label: "LG webOS (Wi-Fi)" },
+  { data: "sony_bravia", label: "Sony Bravia (PSK)" },
+  { data: "roku_ecp", label: "Roku TV (ECP)" },
+  { data: "wol", label: "Wake-on-LAN Only" },
+  { data: "webhook", label: "Webhook / Home Assistant" },
   { data: "none", label: "Disabled" },
 ];
 
@@ -117,7 +101,7 @@ const HDMI_INPUT_OPTIONS: DropdownOption[] = [
   { data: "HDMI3", label: "HDMI 3" },
   { data: "HDMI4", label: "HDMI 4" },
   { data: "AV1", label: "AV 1" },
-  { data: "Tuner", label: "Live TV / Tuner" },
+  { data: "Tuner", label: "Tuner" },
 ];
 
 function parsePortDraft(raw: string, driver: TvDriverKind): number {
@@ -149,25 +133,20 @@ function mergeProfilePatch(
   return out;
 }
 
-function formatDeckModelLabel(model: string): string {
-  if (model === "Jupiter") return "Deck LCD";
-  if (model === "Galileo") return "Deck OLED";
-  return model || "SteamOS";
-}
-
 function formatModeLabel(status: DaemonStatus): string {
   if (!status.selected_output_mode) {
     return status.is_docked ? status.active_connector || "External Display" : "1280x800@60Hz";
   }
   const m = status.selected_output_mode;
-  return `${m.width}x${m.height}@${Math.round(m.refresh_hz)}Hz`;
+  const base = `${m.width}x${m.height}@${Math.round(m.refresh_hz)}Hz`;
+  return status.last_scaling?.enable_vrr ? `${base} VRR` : base;
 }
 
 function formatScalingSummary(status: DaemonStatus): string {
   const s = status.last_scaling;
   if (!s) return "Auto";
   const filter = String(s.scaling_filter || "LINEAR");
-  return `${s.target_width}x${s.target_height} · ${filter} (Sharp ${s.fsr_sharpness})`;
+  return `${s.target_width}x${s.target_height} ${filter} (${s.fsr_sharpness})`;
 }
 
 function shortFingerprint(fp: string): string {
@@ -176,206 +155,14 @@ function shortFingerprint(fp: string): string {
   return `${fp.slice(0, 10)}...${fp.slice(-8)}`;
 }
 
-const HeroStatusCard: FC<{
-  status: DaemonStatus;
-  profile: DockProfile | null;
-  busy: boolean;
-  onRefresh: () => void;
-}> = ({ status, profile, busy, onRefresh }) => {
-  const primaryExternal = status.active_controllers[0];
-  const controllerPrimary = primaryExternal
-    ? `${primaryExternal.name}`
-    : status.builtin_controller_bound
-      ? "Steam Deck (28de:1205)"
-      : "No Active Gamepad";
-
-  const controllerSubParts: string[] = [];
-  if (primaryExternal) {
-    controllerSubParts.push(
-      status.builtin_controller_bound ? "P1 Ext + Deck Bound" : "P1 Ext · Deck Unbound",
-    );
-  } else {
-    controllerSubParts.push(status.builtin_controller_bound ? "Built-in Bound" : "Unbound");
-  }
-  if (status.sleeping_controllers.length > 0) {
-    controllerSubParts.push(`${status.sleeping_controllers.length} sleeping`);
-  }
-
-  const displayName = status.is_docked
-    ? profile?.display_name || status.active_connector || "External Display"
-    : "Built-in Display";
-  const powerLabel = `${status.tdp_watts ?? "--"}W ${status.overclock_active ? "OC" : "TDP"} · ${
-    status.charge_limit > 0 ? `${status.charge_limit}% Cap` : "100% Cap"
-  }`;
-  const powerSubParts: string[] = [];
-  if (status.apu_temp_c != null) {
-    powerSubParts.push(`${status.apu_temp_c.toFixed(1)}°C APU`);
-  }
-  if (status.deck_model === "Jupiter") {
-    powerSubParts.push(`BT Wake: ${status.lcd_bluetooth_wakeup_enabled ? "Armed" : "Off"}`);
-  }
-
-  return (
-    <div style={qamStyles.heroCard(status.is_docked)}>
-      <div style={qamStyles.heroHeader}>
-        <div style={qamStyles.brandGroup}>
-          <SwitchJoyConIcon size={18} />
-          <span style={qamStyles.brandTitle}>SwitchDeck</span>
-        </div>
-        <div style={qamStyles.pillRow}>
-          <span style={qamStyles.pill("steel")}>{formatDeckModelLabel(status.deck_model)}</span>
-          {status.overclock_active && <span style={qamStyles.pill("ochre")}>OC</span>}
-          <span style={qamStyles.pill(status.is_docked ? "orangeSolid" : "steel")}>
-            {status.is_docked ? "Docked" : "Handheld"}
-          </span>
-          <Focusable
-            role="button"
-            tabIndex={0}
-            aria-label="Refresh SwitchDeck status"
-            onActivate={() => {
-              if (!busy) onRefresh();
-            }}
-            onClick={() => {
-              if (!busy) onRefresh();
-            }}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: "22px",
-              height: "22px",
-              borderRadius: "3px",
-              border: `1px solid ${COLORS.borderSubtle}`,
-              background: COLORS.bgElevated,
-              color: COLORS.textSecondary,
-              opacity: busy ? 0.55 : 1,
-              cursor: busy ? "wait" : "pointer",
-              padding: 0,
-            }}
-          >
-            <FaSyncAlt size={10} />
-          </Focusable>
-        </div>
-      </div>
-
-      <div style={qamStyles.statList}>
-        <div style={qamStyles.statRow}>
-          <span style={qamStyles.statLabel}>
-            <FaTv size={11} color={status.is_docked ? COLORS.accent : COLORS.textSecondary} />
-            <span>Display</span>
-          </span>
-          <div style={qamStyles.statValueWrap}>
-            <span style={qamStyles.statValue}>{displayName}</span>
-            <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", justifyContent: "flex-end" }}>
-              <span style={qamStyles.statSub}>{formatModeLabel(status)}</span>
-              {status.last_scaling?.enable_vrr && <span style={qamStyles.pill("orange")}>VRR</span>}
-              {status.ac_online && <span style={qamStyles.pill("sage")}>AC</span>}
-            </div>
-          </div>
-        </div>
-
-        <div style={qamStyles.statRow}>
-          <span style={qamStyles.statLabel}>
-            <FaGamepad size={11} color={primaryExternal ? COLORS.accent : COLORS.textSecondary} />
-            <span>Player 1</span>
-          </span>
-          <div style={qamStyles.statValueWrap}>
-            <span style={qamStyles.statValue}>{controllerPrimary}</span>
-            <span style={qamStyles.statSub}>{controllerSubParts.join(" · ")}</span>
-          </div>
-        </div>
-
-        <div style={qamStyles.statRow}>
-          <span style={qamStyles.statLabel}>
-            <FaVolumeUp size={11} color={COLORS.textSecondary} />
-            <span>Audio</span>
-          </span>
-          <div style={qamStyles.statValueWrap}>
-            <span style={qamStyles.statValue}>{status.audio_sink || "System Default"}</span>
-          </div>
-        </div>
-
-        <div style={qamStyles.statRow}>
-          <span style={qamStyles.statLabel}>
-            <FaSlidersH size={11} color={COLORS.textSecondary} />
-            <span>Scaling</span>
-          </span>
-          <div style={qamStyles.statValueWrap}>
-            <span style={qamStyles.statValue}>{formatScalingSummary(status)}</span>
-            {status.last_scaling?.reason && (
-              <span style={qamStyles.statSub}>{status.last_scaling.reason}</span>
-            )}
-          </div>
-        </div>
-
-        <div style={{ ...qamStyles.statRow, borderBottom: "none" }}>
-          <span style={qamStyles.statLabel}>
-            <FaBolt
-              size={11}
-              color={
-                status.overclock_thermal_throttled
-                  ? COLORS.crimson
-                  : status.overclock_active || status.travel_charge_override
-                    ? COLORS.ochre
-                    : COLORS.sage
-              }
-            />
-            <span>Power</span>
-          </span>
-          <div style={qamStyles.statValueWrap}>
-            <span style={qamStyles.statValue}>{powerLabel}</span>
-            {powerSubParts.length > 0 && (
-              <span style={qamStyles.statSub}>{powerSubParts.join(" · ")}</span>
-            )}
-          </div>
-        </div>
-      </div>
+const StatusRow: FC<{ label: string; value: string }> = ({ label, value }) => (
+  <PanelSectionRow>
+    <div style={qamStyles.statusSummaryRow}>
+      <span style={qamStyles.statusKey}>{label}</span>
+      <span style={qamStyles.statusVal}>{value}</span>
     </div>
-  );
-};
-
-const DiagnosticWarningBanner: FC<{ status: DaemonStatus }> = ({ status }) => {
-  if (
-    status.unhandled_dongles.length === 0 &&
-    !status.last_error &&
-    !status.overclock_thermal_throttled
-  ) {
-    return null;
-  }
-
-  return (
-    <div style={qamStyles.warningCard}>
-      <div style={qamStyles.warningHeader}>
-        <FaExclamationTriangle size={12} />
-        <span>Hardware / Driver Alert</span>
-      </div>
-      <div style={qamStyles.warningBody}>
-        {status.overclock_thermal_throttled && (
-          <div style={{ marginBottom: "5px" }}>
-            <div style={{ fontWeight: 700, color: COLORS.ochre }}>
-              Thermal Watchdog Active (&lt;= 15W)
-            </div>
-            <div style={{ color: COLORS.textSecondary }}>
-              APU reached &gt;= 90°C. Docked Overclock automatically stepped down to safe stock
-              power until cooling below 80°C.
-            </div>
-          </div>
-        )}
-        {status.unhandled_dongles.map((dongle) => (
-          <div key={`${dongle.usb_id}-${dongle.sysfs_path}`} style={{ marginBottom: "5px" }}>
-            <div style={{ fontWeight: 700, color: COLORS.textPrimary }}>
-              [{dongle.usb_id}] {dongle.device_name}
-            </div>
-            <div style={{ color: COLORS.textSecondary }}>{dongle.remediation}</div>
-          </div>
-        ))}
-        {status.last_error && (
-          <div style={{ color: "#f2b8b5" }}>Daemon notice: {status.last_error}</div>
-        )}
-      </div>
-    </div>
-  );
-};
+  </PanelSectionRow>
+);
 
 export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   transport,
@@ -394,7 +181,6 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   const [ocFeedback, setOcFeedback] = useState<FeedbackMessage | null>(null);
   const [certMismatch, setCertMismatch] = useState<boolean>(false);
 
-  // Local drafts so sliders & text inputs stay fluid
   const [fsrDraft, setFsrDraft] = useState<number>(initialProfile?.fsr_sharpness ?? 2);
   const [dockedTdpDraft, setDockedTdpDraft] = useState<number>(initialProfile?.docked_tdp_watts ?? 15);
   const [handheldTdpDraft, setHandheldTdpDraft] = useState<number>(
@@ -551,7 +337,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         if (!mountedRef.current) return;
         setStatus(refreshed);
         if (message) {
-          setTargetMsg({ tone: "orange", text: message });
+          setTargetMsg({ tone: "accent", text: message });
         }
       } catch (err) {
         if (mountedRef.current) {
@@ -623,15 +409,20 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setBusy(true);
     try {
       const next = await transport.setKeepBuiltin(checked);
+      if (!mountedRef.current) return;
       setStatus(next);
       setFeedback({
-        tone: "orange",
+        tone: "accent",
         text: checked ? "Built-in Deck controls kept active" : "Smart P1 auto-handoff enabled",
       });
     } catch (err) {
-      setFeedback({ tone: "crimson", text: String(err) });
+      if (mountedRef.current) {
+        setFeedback({ tone: "crimson", text: String(err) });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
   };
 
@@ -639,15 +430,20 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setBusy(true);
     try {
       const next = await transport.setChargeOverride(checked);
+      if (!mountedRef.current) return;
       setStatus(next);
       setFeedback({
-        tone: checked ? "orange" : "sage",
+        tone: checked ? "accent" : "sage",
         text: checked ? "Travel Charge 100% active until undock" : "80% battery cap restored",
       });
     } catch (err) {
-      setFeedback({ tone: "crimson", text: String(err) });
+      if (mountedRef.current) {
+        setFeedback({ tone: "crimson", text: String(err) });
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
   };
 
@@ -663,7 +459,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     if (!transport.applyNativeAppResolution) {
       setFeedback({
         tone: "crimson",
-        text: "Native SteamClient app override unavailable here",
+        text: "Native SteamClient app override unavailable",
       });
       return;
     }
@@ -700,7 +496,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       setFeedback({
         tone: res.ok ? "sage" : "crimson",
         text: res.ok
-          ? "Sent GAMESCOPE_DISPLAY_MODE_NUDGE to HDMI output"
+          ? "Sent display mode nudge to HDMI output"
           : "Display nudge returned false (no active Gamescope display)",
       });
     } catch (err) {
@@ -725,7 +521,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       setStatus(next);
       setFeedback({
         tone: "sage",
-        text: "Emergency rebind complete: Deck controls (28de:1205) restored",
+        text: "Deck built-in controls restored",
       });
     } catch (err) {
       if (mountedRef.current) {
@@ -771,7 +567,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     }
     const cleanPsk = tvPskDraft.trim();
     if (driverKind === "sony_bravia" && !cleanPsk && !profile?.tv_paired) {
-      setTvFeedback({ tone: "crimson", text: "Enter Sony TV Pre-Shared Key (PSK) before verifying" });
+      setTvFeedback({ tone: "crimson", text: "Enter Sony TV Pre-Shared Key (PSK)" });
       return;
     }
 
@@ -779,7 +575,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
     setPairingBusy(true);
     setCertMismatch(false);
     setTvFeedback({
-      tone: "orange",
+      tone: "accent",
       text:
         driverKind === "sony_bravia"
           ? `Verifying Sony Bravia PSK on ${cleanHost}...`
@@ -816,12 +612,12 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         if (!mountedRef.current) return;
         let msg: string;
         if (driverKind === "lg_webos") {
-          msg = `LG webOS TV paired & client-key saved (${cleanHost})`;
+          msg = `LG webOS TV paired (${cleanHost})`;
         } else if (driverKind === "sony_bravia") {
-          msg = `Sony Bravia PSK verified & saved (${cleanHost})`;
+          msg = `Sony Bravia PSK verified (${cleanHost})`;
         } else {
           msg = res.token_saved
-            ? `Samsung TV paired & TLS cert pinned (${cleanHost})`
+            ? `Samsung TV paired (${cleanHost})`
             : `Connected to ${cleanHost} — accept Allow prompt on TV`;
         }
         setTvFeedback({ tone: "sage", text: msg });
@@ -874,8 +670,8 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       setTvFeedback({
         tone: res.ok ? "sage" : "crimson",
         text: res.ok
-          ? "TV wake & input switch signal sent"
-          : res.error || "TV wake failed — check TV power/network/driver config",
+          ? "TV wake signal sent"
+          : res.error || "TV wake failed — check TV power or network",
       });
     } catch (err) {
       if (mountedRef.current) {
@@ -891,7 +687,11 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
   if (loading && !status) {
     return (
       <div style={qamStyles.root}>
-        <div style={qamStyles.heroCard(false)}>Loading SwitchDeck hardware state...</div>
+        <PanelSection title="Status">
+          <PanelSectionRow>
+            <div style={qamStyles.helperNote("neutral")}>Loading SwitchDeck status...</div>
+          </PanelSectionRow>
+        </PanelSection>
       </div>
     );
   }
@@ -937,52 +737,107 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
           cpu_boost: preset.cpu_boost,
         },
       },
-      `Applied preset: ${preset.label}`,
+      `Preset applied: ${preset.label}`,
       { target: "oc" },
     );
   };
 
-  let ocPillTone: "ochre" | "crimson" | "steel" = "steel";
-  let ocPillLabel = "Stock <= 15W";
+  // Concise status strings
+  const primaryExternal = status?.active_controllers[0];
+  const controllerValue = primaryExternal
+    ? `${primaryExternal.name}${status?.builtin_controller_bound ? " (+Deck)" : ""}`
+    : status?.builtin_controller_bound
+      ? "Steam Deck (Built-in)"
+      : "No Active Gamepad";
+  const displayName = status?.is_docked
+    ? profile?.display_name || status.active_connector || "External Display"
+    : "Built-in Display";
+  const powerParts: string[] = [
+    `${status?.tdp_watts ?? "--"}W${status?.overclock_active ? " OC" : ""}`,
+    status && status.charge_limit > 0 ? `${status.charge_limit}% Cap` : "100% Cap",
+  ];
+  if (status?.apu_temp_c != null) {
+    powerParts.push(`${status.apu_temp_c.toFixed(0)}°C`);
+  }
+  if (status?.deck_model === "Jupiter" && status.lcd_bluetooth_wakeup_enabled) {
+    powerParts.push("BT Wake");
+  }
+
+  const hasAlerts = Boolean(
+    status &&
+      (status.unhandled_dongles.length > 0 ||
+        status.last_error ||
+        status.overclock_thermal_throttled),
+  );
+
+  let ocSummaryLine = `Stock <= 15W`;
+  let ocSummaryTone: "neutral" | "ochre" | "crimson" = "neutral";
   if (status?.overclock_thermal_throttled) {
-    ocPillTone = "crimson";
-    ocPillLabel = "Thermal Step-Down <= 15W";
+    ocSummaryLine = "Thermal step-down <= 15W (APU >= 90°C)";
+    ocSummaryTone = "crimson";
   } else if (status?.overclock_active) {
-    ocPillTone = "ochre";
-    ocPillLabel = "OC Active";
+    ocSummaryLine =
+      status.overclock_status_note ||
+      `Active: ${boostTdpDraft}W · ${gpuMaxDraft <= 1600 ? "GPU Auto" : `${gpuMaxDraft} MHz`}`;
+    ocSummaryTone = "ochre";
   } else if (oc.enabled && !status?.is_docked) {
-    ocPillTone = "steel";
-    ocPillLabel = "Standby (Handheld)";
+    ocSummaryLine = "Armed (applies when docked on AC)";
   } else if (oc.enabled && !status?.ac_online) {
-    ocPillTone = "crimson";
-    ocPillLabel = "Blocked (No AC)";
+    ocSummaryLine = "Blocked: connect AC power";
+    ocSummaryTone = "crimson";
+  }
+  if (status?.apu_temp_c != null) {
+    ocSummaryLine = `${ocSummaryLine} · ${status.apu_temp_c.toFixed(0)}°C`;
   }
 
   return (
     <div style={qamStyles.root}>
       {status && (
-        <>
-          <HeroStatusCard
-            status={status}
-            profile={profile}
-            busy={busy}
-            onRefresh={() => void refreshAll()}
-          />
-          <DiagnosticWarningBanner status={status} />
-        </>
+        <PanelSection title={status.is_docked ? "Status · Docked" : "Status · Handheld"}>
+          <StatusRow label="Display" value={`${displayName} · ${formatModeLabel(status)}`} />
+          <StatusRow label="Controller" value={controllerValue} />
+          <StatusRow label="Audio" value={status.audio_sink || "System Default"} />
+          <StatusRow label="Scaling" value={formatScalingSummary(status)} />
+          <StatusRow label="Power" value={powerParts.join(" · ")} />
+        </PanelSection>
+      )}
+
+      {hasAlerts && status && (
+        <PanelSection title="Alerts">
+          {status.overclock_thermal_throttled && (
+            <PanelSectionRow>
+              <div style={qamStyles.helperNote("ochre")}>
+                Thermal Watchdog Active (&lt;= 15W): APU reached &gt;= 90°C and stepped down
+                until cooling below 80°C.
+              </div>
+            </PanelSectionRow>
+          )}
+          {status.unhandled_dongles.map((dongle) => (
+            <PanelSectionRow key={`${dongle.usb_id}-${dongle.sysfs_path}`}>
+              <div style={qamStyles.helperNote("crimson")}>
+                <strong>[{dongle.usb_id}] {dongle.device_name}:</strong> {dongle.remediation}
+              </div>
+            </PanelSectionRow>
+          ))}
+          {status.last_error && (
+            <PanelSectionRow>
+              <div style={qamStyles.helperNote("crimson")}>{status.last_error}</div>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
       )}
 
       {feedback && (
-        <div style={qamStyles.inlineFeedback(feedback.tone)} role="status">
+        <div style={qamStyles.helperNote(feedback.tone)} role="status">
           {feedback.text}
         </div>
       )}
 
-      <PanelSection title="Quick Controls & Failsafes">
+      <PanelSection title="Quick Controls">
         <PanelSectionRow>
           <ToggleField
             label="Keep Built-in Controls"
-            description="Keep Steam Deck buttons active alongside external P1"
+            description="Keep Steam Deck inputs active with external P1"
             checked={Boolean(status?.manual_keep_builtin)}
             disabled={busy}
             onChange={(val) => void handleKeepBuiltinToggle(val)}
@@ -991,7 +846,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         <PanelSectionRow>
           <ToggleField
             label="Travel Charge 100%"
-            description="Override 80% dock cap until undock"
+            description="Override 80% dock battery cap until undock"
             checked={Boolean(status?.travel_charge_override)}
             disabled={busy}
             onChange={(val) => void handleChargeOverrideToggle(val)}
@@ -999,8 +854,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
-            label="Switch Click-Clack HUD"
-            description="Play Switch rail chime & transition toast"
+            label="Transition Notification"
             checked={chimeEnabled}
             onChange={handleChimeToggle}
           />
@@ -1011,12 +865,12 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
             disabled={busy}
             description={
               status?.is_docked
-                ? `Set running Steam app override to ${profile?.preferred_container_width ?? 1920}x${profile?.preferred_container_height ?? 1080}`
-                : "Reset running Steam app resolution override"
+                ? `Set running app override to ${profile?.preferred_container_width ?? 1920}x${profile?.preferred_container_height ?? 1080}`
+                : "Reset running app override"
             }
             onClick={() => void handleAutoNativeAppRes()}
           >
-            Sync Native App Resolution
+            Sync Game Resolution
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
@@ -1025,15 +879,8 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={busy}
-            onClick={() => void handleRebindBuiltin()}
-          >
-            <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <FaPlug size={11} color={COLORS.accent} />
-              <span>Emergency Rebind Deck Controls</span>
-            </span>
+          <ButtonItem layout="below" disabled={busy} onClick={() => void handleRebindBuiltin()}>
+            Rebind Deck Controls
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
@@ -1041,7 +888,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
       {profile && (
         <>
           <div ref={scalingSectionRef}>
-            <PanelSection title="Display & Scaling Profile">
+            <PanelSection title="Display & Power">
               <PanelSectionRow>
                 <DropdownItem
                   label="Container Target"
@@ -1054,7 +901,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
               <PanelSectionRow>
                 <ToggleField
                   label="Adaptive GPU Step-Down"
-                  description="Auto-step container if GPU stays >= 97%"
+                  description="Lower resolution if GPU load >= 97%"
                   checked={profile.adaptive_gpu_downscale}
                   disabled={busy}
                   onChange={(val) =>
@@ -1108,8 +955,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
               </PanelSectionRow>
               <PanelSectionRow>
                 <ToggleField
-                  label="Brief Pause on Undock"
-                  description="Pause game briefly while undock settles"
+                  label="Pause on Undock"
                   checked={profile.auto_pause_on_undock}
                   disabled={busy}
                   onChange={(val) =>
@@ -1157,7 +1003,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 <>
                   <PanelSectionRow>
                     <TextField
-                      label={activeDriver === "wol" ? "Broadcast IP (Optional)" : "TV Host / IP"}
+                      label={activeDriver === "wol" ? "Broadcast IP" : "TV Host / IP"}
                       placeholder={activeDriver === "wol" ? "255.255.255.255" : "192.168.1.50"}
                       value={tvHostDraft}
                       disabled={busy}
@@ -1179,26 +1025,19 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       }}
                     />
                   </PanelSectionRow>
+                  <PanelSectionRow>
+                    <TextField
+                      label="TV MAC (WoL)"
+                      placeholder="AA:BB:CC:DD:EE:FF"
+                      value={tvMacDraft}
+                      disabled={busy}
+                      onChange={(e) => {
+                        markTvDraftDirty();
+                        setTvMacDraft(e.target.value);
+                      }}
+                    />
+                  </PanelSectionRow>
                 </>
-              )}
-
-              {(activeDriver === "samsung_tizen" ||
-                activeDriver === "lg_webos" ||
-                activeDriver === "sony_bravia" ||
-                activeDriver === "roku_ecp" ||
-                activeDriver === "wol") && (
-                <PanelSectionRow>
-                  <TextField
-                    label="TV MAC (WoL)"
-                    placeholder="AA:BB:CC:DD:EE:FF"
-                    value={tvMacDraft}
-                    disabled={busy}
-                    onChange={(e) => {
-                      markTvDraftDirty();
-                      setTvMacDraft(e.target.value);
-                    }}
-                  />
-                </PanelSectionRow>
               )}
 
               {(activeDriver === "lg_webos" ||
@@ -1215,7 +1054,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       const nextInput = String(opt.data || "HDMI2");
                       void commitProfilePatch(
                         { tv: { hdmi_input: nextInput } },
-                        `TV HDMI input set to ${opt.label}`,
+                        `TV input set to ${opt.label}`,
                         { target: "tv" },
                       );
                     }}
@@ -1226,13 +1065,9 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
               {activeDriver === "sony_bravia" && (
                 <PanelSectionRow>
                   <TextField
-                    label="Pre-Shared Key (PSK)"
+                    label="Pre-Shared Key"
                     bIsPassword
-                    placeholder={
-                      profile.tv_paired
-                        ? "Saved (enter new PSK to replace)"
-                        : "Set in TV Network -> IP Control"
-                    }
+                    placeholder={profile.tv_paired ? "Saved (enter new PSK)" : "TV PSK"}
                     value={tvPskDraft}
                     disabled={busy}
                     onChange={(e) => {
@@ -1243,90 +1078,39 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                 </PanelSectionRow>
               )}
 
+              {activeDriver === "webhook" && (
+                <PanelSectionRow>
+                  <TextField
+                    label="Webhook URL"
+                    placeholder="http://homeassistant.local:8123/api/webhook/switchdeck"
+                    value={tvWebhookDraft}
+                    disabled={busy}
+                    onChange={(e) => {
+                      markTvDraftDirty();
+                      setTvWebhookDraft(e.target.value);
+                    }}
+                  />
+                </PanelSectionRow>
+              )}
+
               {(activeDriver === "samsung_tizen" || activeDriver === "lg_webos") &&
                 (hasCertPin || profile.tv_paired) && (
                   <PanelSectionRow>
-                    <div style={qamStyles.certCard}>
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: "6px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: "5px",
-                            fontSize: "11px",
-                            fontWeight: 700,
-                            color: COLORS.sage,
-                          }}
-                        >
-                          <FaShieldAlt size={11} />
-                          <span>{hasCertPin ? "TLS Cert Pin Active" : "WebSocket Paired"}</span>
+                    <div style={qamStyles.helperNote("sage")}>
+                      {profile.tv_paired ? "Paired" : "Connected"}
+                      {profile.tv_cert_fingerprint ? (
+                        <span style={qamStyles.monoSubtle}>
+                          {" "}
+                          · sha256: {shortFingerprint(profile.tv_cert_fingerprint)}
                         </span>
-                        <div style={{ display: "flex", gap: "4px" }}>
-                          {profile.tv_paired && (
-                            <span style={qamStyles.pill("sage")}>
-                              <FaCheckCircle size={9} />
-                              <span>Paired</span>
-                            </span>
-                          )}
-                          {hasCertPin && (
-                            <span style={qamStyles.pill("steel")}>
-                              <FaLock size={9} />
-                              <span>TOFU Pinned</span>
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      {profile.tv_cert_fingerprint && (
-                        <span style={qamStyles.monoCode}>
-                          sha256: {shortFingerprint(profile.tv_cert_fingerprint)}
-                        </span>
-                      )}
+                      ) : null}
                     </div>
                   </PanelSectionRow>
                 )}
 
               {activeDriver === "sony_bravia" && profile.tv_paired && (
                 <PanelSectionRow>
-                  <div style={qamStyles.certCard}>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "6px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "5px",
-                          fontSize: "11px",
-                          fontWeight: 700,
-                          color: COLORS.sage,
-                        }}
-                      >
-                        <FaShieldAlt size={11} />
-                        <span>Pre-Shared Key Configured</span>
-                      </span>
-                      <span style={qamStyles.pill("sage")}>
-                        <FaCheckCircle size={9} />
-                        <span>PSK Saved</span>
-                      </span>
-                    </div>
-                    <span style={qamStyles.statSub}>
-                      Stored in 0600 tv_tokens.json (never sent back to UI)
-                    </span>
-                  </div>
+                  <div style={qamStyles.helperNote("sage")}>Pre-Shared Key saved</div>
                 </PanelSectionRow>
               )}
 
@@ -1352,52 +1136,38 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                     disabled={busy || pairingBusy}
                     onClick={() => void handlePairTv(false)}
                   >
-                    <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                      <FaWifi size={11} color={COLORS.accent} />
-                      <span>
-                        {pairingBusy
-                          ? "Pairing — Accept Prompt on TV..."
-                          : activeDriver === "lg_webos"
-                            ? "Pair LG webOS TV"
-                            : activeDriver === "sony_bravia"
-                              ? "Save & Verify Sony PSK"
-                              : "Pair Samsung TV"}
-                      </span>
-                    </span>
+                    {pairingBusy
+                      ? "Pairing — Accept Prompt on TV..."
+                      : activeDriver === "lg_webos"
+                        ? "Pair LG webOS TV"
+                        : activeDriver === "sony_bravia"
+                          ? "Save & Verify Sony PSK"
+                          : "Pair Samsung TV"}
                   </ButtonItem>
                 </PanelSectionRow>
               )}
 
-              {activeDriver === "webhook" && (
-                <PanelSectionRow>
-                  <TextField
-                    label="Webhook URL"
-                    placeholder="http://homeassistant.local:8123/api/webhook/switchdeck"
-                    value={tvWebhookDraft}
-                    disabled={busy}
-                    onChange={(e) => {
-                      markTvDraftDirty();
-                      setTvWebhookDraft(e.target.value);
-                    }}
-                  />
-                </PanelSectionRow>
-              )}
+              {(tvDirty || Boolean(tvPskDraft.trim())) &&
+                activeDriver !== "none" &&
+                activeDriver !== "cec" && (
+                  <PanelSectionRow>
+                    <ButtonItem
+                      layout="below"
+                      disabled={busy || pairingBusy}
+                      onClick={() => void handleSaveTvSettings()}
+                    >
+                      Save TV Settings
+                    </ButtonItem>
+                  </PanelSectionRow>
+                )}
 
-              {(tvDirty || Boolean(tvPskDraft.trim())) && activeDriver !== "none" && activeDriver !== "cec" && (
+              {activeDriver !== "none" && (
                 <PanelSectionRow>
                   <ButtonItem
                     layout="below"
                     disabled={busy || pairingBusy}
-                    onClick={() => void handleSaveTvSettings()}
+                    onClick={() => void handleTestTvWake()}
                   >
-                    Save TV Settings
-                  </ButtonItem>
-                </PanelSectionRow>
-              )}
-
-              {activeDriver !== "none" && (
-                <PanelSectionRow>
-                  <ButtonItem layout="below" disabled={busy || pairingBusy} onClick={() => void handleTestTvWake()}>
                     Test TV Wake
                   </ButtonItem>
                 </PanelSectionRow>
@@ -1405,7 +1175,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
               {tvFeedback && (
                 <PanelSectionRow>
-                  <div style={qamStyles.inlineFeedback(tvFeedback.tone)} role="status">
+                  <div style={qamStyles.helperNote(tvFeedback.tone)} role="status">
                     {tvFeedback.text}
                   </div>
                 </PanelSectionRow>
@@ -1414,40 +1184,13 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
           </div>
 
           <div ref={overclockSectionRef}>
-            <PanelSection title="Experimental: Docked Overclock">
+            <PanelSection title="Docked Overclock (Experimental)">
               {!oc.risk_acknowledged ? (
                 <>
                   <PanelSectionRow>
-                    <div style={qamStyles.overclockWarningCard}>
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          color: COLORS.ochre,
-                          fontSize: "11.5px",
-                          fontWeight: 700,
-                          marginBottom: "4px",
-                        }}
-                      >
-                        <FaExclamationTriangle size={12} />
-                        <span>Experimental Power &amp; Clock Warning</span>
-                      </div>
-                      <div style={qamStyles.warningBody}>
-                        <div style={{ marginBottom: "3px" }}>
-                          <strong>Volatile sysfs only:</strong> zero BIOS/NVRAM edits, zero
-                          undervolting or memory timing writes (avoids idle C-state crashes).
-                        </div>
-                        <div style={{ marginBottom: "3px" }}>
-                          <strong>Thermals &amp; PD supply:</strong> raises sustained heat and fan
-                          noise. Use a 45W-65W+ PD charger when boosting through a USB-C hub.
-                        </div>
-                        <div>
-                          <strong>Guardrails:</strong> hard-capped at 22W / 2000 MHz (community safe:
-                          18-19W LCD, 19-22W OLED), requires AC power, steps down at &gt;= 90°C, and
-                          resets to stock on undock. You assume thermal &amp; hardware risk.
-                        </div>
-                      </div>
+                    <div style={qamStyles.helperNote("neutral")}>
+                      Volatile sysfs overclock (up to 22W TDP / 2000 MHz GPU, no undervolting or
+                      BIOS edits). Requires AC power and resets on undock or &gt;= 90°C.
                     </div>
                   </PanelSectionRow>
                   <PanelSectionRow>
@@ -1457,20 +1200,17 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                       onClick={() =>
                         void commitProfilePatch(
                           { overclock: { risk_acknowledged: true } },
-                          "Experimental docked overclock unlocked (disabled until toggled on)",
+                          "Docked overclock unlocked (off until enabled)",
                           { target: "oc" },
                         )
                       }
                     >
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaBolt size={11} color={COLORS.ochre} />
-                        <span>I Understand — Unlock Experimental Controls</span>
-                      </span>
+                      Unlock Experimental Controls
                     </ButtonItem>
                   </PanelSectionRow>
                   {ocFeedback && (
                     <PanelSectionRow>
-                      <div style={qamStyles.inlineFeedback(ocFeedback.tone)} role="status">
+                      <div style={qamStyles.helperNote(ocFeedback.tone)} role="status">
                         {ocFeedback.text}
                       </div>
                     </PanelSectionRow>
@@ -1479,40 +1219,12 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
               ) : (
                 <>
                   <PanelSectionRow>
-                    <div style={qamStyles.telemetryCard}>
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: "6px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span style={qamStyles.pill(ocPillTone)}>
-                          <FaBolt size={9} />
-                          <span>{ocPillLabel}</span>
-                        </span>
-                        <span style={qamStyles.statSub}>
-                          APU{" "}
-                          {status?.apu_temp_c != null ? `${status.apu_temp_c.toFixed(0)}°C` : "--"}{" "}
-                          · SMU {status?.hw_max_tdp_watts ?? 22}W
-                        </span>
-                      </div>
-                      <div style={{ fontSize: "10.5px", color: COLORS.textPrimary, fontWeight: 600 }}>
-                        {status?.overclock_status_note ||
-                          `Target ${boostTdpDraft}W · ${gpuMaxDraft <= 1600 ? "GPU Stock Auto" : `GPU 400-${gpuMaxDraft} MHz`} · CPU Boost ${oc.cpu_boost ? "On" : "Off"}`}
-                      </div>
-                      <div style={{ fontSize: "10px", color: COLORS.textSecondary, lineHeight: 1.35 }}>
-                        45W-65W+ PD charger recommended on hubs · Auto-steps &lt;= 15W at &gt;=
-                        90°C
-                      </div>
-                    </div>
+                    <div style={qamStyles.helperNote(ocSummaryTone)}>{ocSummaryLine}</div>
                   </PanelSectionRow>
 
                   {ocFeedback && (
                     <PanelSectionRow>
-                      <div style={qamStyles.inlineFeedback(ocFeedback.tone)} role="status">
+                      <div style={qamStyles.helperNote(ocFeedback.tone)} role="status">
                         {ocFeedback.text}
                       </div>
                     </PanelSectionRow>
@@ -1530,20 +1242,17 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
                   <PanelSectionRow>
                     <ToggleField
-                      label="Enable Docked Overclock"
-                      description="Applies only when docked on AC; auto-resets on undock or >= 90°C limit"
+                      label="Enable Overclock"
                       checked={oc.enabled}
                       disabled={busy}
                       onChange={(val) =>
                         void commitProfilePatch(
                           { overclock: { enabled: val } },
                           val
-                            ? status?.is_docked
-                              ? status.ac_online
-                                ? "Experimental docked overclock active"
-                                : "Overclock armed (waiting for AC power)"
-                              : "Overclock armed (applies when docked on AC)"
-                            : "Overclock disabled — restored stock <= 15W",
+                            ? status?.is_docked && status.ac_online
+                              ? "Docked overclock active"
+                              : "Overclock armed (waiting for dock + AC)"
+                            : "Overclock disabled (<= 15W stock)",
                           { target: "oc" },
                         )
                       }
@@ -1552,7 +1261,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
                   <PanelSectionRow>
                     <SliderField
-                      label="Boost Sustained TDP"
+                      label="Boost TDP"
                       value={boostTdpDraft}
                       min={15}
                       max={22}
@@ -1568,7 +1277,7 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
                   <PanelSectionRow>
                     <SliderField
-                      label={gpuMaxDraft <= 1600 ? "Max GPU Clock (Stock Auto)" : "Max GPU Clock (400+)"}
+                      label={gpuMaxDraft <= 1600 ? "Max GPU (Auto)" : "Max GPU Clock"}
                       value={gpuMaxDraft}
                       min={1600}
                       max={2000}
@@ -1586,16 +1295,14 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
 
                   <PanelSectionRow>
                     <ToggleField
-                      label="Docked CPU Turbo Boost"
-                      description="Turn off in GPU-bound AAA titles to leave more SMU power headroom for GPU"
+                      label="CPU Turbo Boost"
+                      description="Turn off in GPU-bound games for extra GPU power headroom"
                       checked={oc.cpu_boost}
                       disabled={busy}
                       onChange={(val) =>
                         void commitProfilePatch(
                           { overclock: { cpu_boost: val } },
-                          val
-                            ? "Docked CPU turbo boost enabled"
-                            : "Docked CPU turbo boost disabled for GPU power headroom",
+                          val ? "CPU turbo boost enabled" : "CPU turbo boost disabled",
                           { target: "oc" },
                         )
                       }
@@ -1619,15 +1326,12 @@ export const QuickAccessPanel: FC<QuickAccessPanelProps> = ({
                               cpu_boost: true,
                             },
                           },
-                          "Overclock reset to stock 15W and controls locked",
+                          "Overclock reset to stock 15W and locked",
                           { target: "oc" },
                         );
                       }}
                     >
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                        <FaLock size={11} color={COLORS.crimson} />
-                        <span>Reset &amp; Lock Overclock Controls</span>
-                      </span>
+                      Reset &amp; Lock
                     </ButtonItem>
                   </PanelSectionRow>
                 </>
